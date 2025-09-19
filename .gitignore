@@ -1,0 +1,128 @@
+# ==============================
+# Datahive — .gitignore
+# ==============================
+# Objetivo: manter o repositório limpo de credenciais, dados brutos, artefatos locais e arquivos temporários.
+# Edite conforme a sua necessidade. Itens sensíveis e diretórios de dados já estão cobertos por padrão.
+
+# --- Python / Bytecode ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Ambientes virtuais ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Build / Packaging ---
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Test / Tipagem ---
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.tox/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- IDE / SO ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# --- Streamlit ---
+# Mantenha apenas configs não sensíveis
+.streamlit/secrets.toml
+.streamlit/.secrets/
+.streamlit/state/
+!.streamlit/config.toml
+
+# --- Credenciais e Segredos ---
+# (Cobre .env e variações; tokens, chaves, certificados)
+.env
+.env.*
+*.env
+.envrc
+**/.env.local
+**/config.local.json
+**/local_config.json
+
+# Padrões comuns de arquivos sensíveis
+*.pem
+*.key
+*.p12
+*token*.json
+*secret*.json
+*credentials*.json
+*secrets*.json
+
+# Diretórios de segredos
+secrets/
+.secret/
+
+# --- Diretórios de Tokens (Datahive) ---
+# Tudo que for token/credencial gerado pela app
+tokens/
+**/tokens/
+
+# --- Dados (brutos, processados e caches) ---
+# Evite versionar dados volumosos/mutáveis. Use amostras em data/samples/ quando necessário.
+data/
+**/raw/
+**/pp/
+**/backup/
+**/backups/
+**/out/
+**/outputs/
+**/cache/
+**/.cache/
+
+# Permitir exemplos e documentação dentro de data/
+!data/samples/**
+!data/README.md
+
+# --- Logs e temporários ---
+logs/
+*.log
+*.pid
+*.bak
+*.old
+*.tmp
+.tmp/
+tmp/
+temp/
+
+# --- Exportações comuns (opcional) ---
+# Caso queira manter planilhas/CSVs fora do repo, descomente as linhas abaixo.
+# **/*.csv
+# **/*.xlsx
+# **/*.parquet
+# **/exports/
+
+# --- Artefatos específicos citados no projeto ---
+# Backups e snapshots com timestamp
+*mg_*.json
+*sp_*.json
+*_latest.json
+
+# --- Arquivos de SO/Editor que às vezes aparecem ---
+*.orig
+*.rej
+
+# --- Node/NPM (se existir no monorepo) ---
+# node_modules/
+# .npm/
+# package-lock.json # (mantenha se usar Node)
+
+# --- Docker / Compose (se gerar arquivos locais) ---
+# .docker/
+# .env.docker.local
