@@ -2,12 +2,14 @@
 from __future__ import annotations
 import argparse
 import json
+import re
 import tempfile
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional, List, Tuple
 
 from app.config.paths import DATA_DIR, backup_path  # fonte única de paths
+from app.utils.core.result_sink.service import resolve_sink_from_flags  # fábrica de sinks
 
 # ---------------- utils locais: io atômico + rotação ---------------- #
 def ensure_dir(p: Path) -> Path:
@@ -62,10 +64,11 @@ def anuncios_pp_path(regiao: str) -> Path:
 
 # --------------------- extractors --------------------- #
 def _extract_sku(item: Dict[str, Any]) -> Optional[str]:
-    for k in ("seller_custom_field", "seller_sku", "catalog_product_id", "sku"):
-        v = item.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
+    """
+    Regra:
+    1) Priorizar atributo SELLER_SKU -> value_name (ou name dentro de values)
+    2) Fallback: campos livres conhecidos do item
+    """
     attrs = item.get("attributes") or []
     if isinstance(attrs, list):
         for a in attrs:
@@ -73,10 +76,48 @@ def _extract_sku(item: Dict[str, Any]) -> Optional[str]:
                 continue
             aid = str(a.get("id") or "").upper()
             aname = str(a.get("name") or "").upper()
-            if aid in {"SELLER_SKU", "SKU"} or "SKU" in aname:
-                val = a.get("value_name") or a.get("value_id")
+            if aid == "SELLER_SKU" or "SKU" in aname:
+                val = a.get("value_name")
+                if not val:
+                    vals = a.get("values") or []
+                    if isinstance(vals, list) and vals:
+                        val = vals[0].get("name")
                 if isinstance(val, str) and val.strip():
                     return val.strip()
+    for k in ("seller_custom_field", "seller_sku", "catalog_product_id", "sku"):
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+def _only_digits(s: Optional[str]) -> Optional[str]:
+    if not isinstance(s, str):
+        return None
+    d = re.sub(r"\D+", "", s)
+    return d or None
+
+def _extract_gtin(item: Dict[str, Any]) -> Optional[str]:
+    """
+    Procura atributo GTIN e retorna value_name (normalizado em dígitos).
+    Aceita variações de name: 'GTIN' ou 'Código universal de produto'.
+    """
+    attrs = item.get("attributes") or []
+    if not isinstance(attrs, list):
+        return None
+    for a in attrs:
+        if not isinstance(a, dict):
+            continue
+        aid = str(a.get("id") or "").upper()
+        aname = str(a.get("name") or "").strip().upper()
+        if aid == "GTIN" or "GTIN" in aname or "CÓDIGO UNIVERSAL DE PRODUTO" in aname:
+            val = a.get("value_name")
+            if not val:
+                vals = a.get("values") or []
+                if isinstance(vals, list) and vals:
+                    val = vals[0].get("name")
+            val = _only_digits(val) if isinstance(val, str) else None
+            if val:
+                return val
     return None
 
 def _extract_title(item: Dict[str, Any]) -> Optional[str]:
@@ -128,6 +169,7 @@ def preprocess_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out.append({
             "mlb": mlb,
             "sku": _extract_sku(it),
+            "gtin": _extract_gtin(it),
             "title": _extract_title(it),
             "estoque": _extract_available_qty(it),
             "price": price,
@@ -141,6 +183,16 @@ def preprocess_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def main():
     ap = argparse.ArgumentParser(description="Gera PP de anúncios (MELI) a partir do RAW agregado.")
     ap.add_argument("--regiao", required=True, choices=["MG", "SP"], help="Região (MG ou SP)")
+    # flags para emitir relatório via result_sink
+    ap.add_argument("--to-file", dest="to_file", action="store_true")
+    ap.add_argument("--no-to-file", dest="to_file", action="store_false")
+    ap.set_defaults(to_file=True)
+    ap.add_argument("--stdout", dest="to_stdout", action="store_true")
+    ap.add_argument("--no-stdout", dest="to_stdout", action="store_false")
+    ap.set_defaults(to_stdout=True)
+    ap.add_argument("--outfile", help="Nome exato de saída do relatório (opcional)")
+    ap.add_argument("--prefix", default="anuncios_pp", help="Prefixo do relatório (JsonFileSink)")
+    ap.add_argument("--keep", type=int, default=2, help="Qtde de backups do relatório (JsonFileSink)")
     args = ap.parse_args()
 
     regiao = args.regiao.upper()
@@ -175,6 +227,17 @@ def main():
 
     atomic_write_json(dst, output, do_backup=True)
     rotate_backups(dst, keep_last_n=2)
+
+    # Relatório via result_sink (stdout/json configurável) — não substitui o PP oficial
+    sink = resolve_sink_from_flags(
+        to_file=args.to_file,
+        to_stdout=args.to_stdout,
+        output_dir=dst.parent,  # grava relatório no mesmo diretório do PP
+        prefix=args.prefix,
+        keep=args.keep,
+        filename=args.outfile,
+    )
+    sink.emit({"path": str(dst), "total": len(pp_list), "regiao": regiao.lower()}, name=f"pp_{regiao.lower()}")
 
     print(f"OK: PP gerado ({len(pp_list)} anúncios) em {dst}")
 

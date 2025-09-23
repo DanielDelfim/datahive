@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import argparse
-import json
 from datetime import datetime, timezone
 from pathlib import Path
+from app.utils.core.result_sink.service import make_sink
 from typing import Iterable, Dict, Any
 
 # --- Imports do projeto ---
@@ -59,12 +59,7 @@ def build_payload(lojas: Iterable[str], windows: Iterable[int]) -> Dict[str, Any
     return data
 
 
-def write_json_atomic(payload: Dict[str, Any], dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    tmp.replace(dest)
+# saída agora é delegada ao ResultSink (json com backup+rotação)
 
 
 def main() -> None:
@@ -95,12 +90,16 @@ def main() -> None:
 
     # Caminho de saída: C:\Apps\Datahive\data\marketplaces\meli\reposicao\results\vendas_7_15_30.json
     results_dir = RESULTS_DIR()
-    out_path = Path(args.outfile) if args.outfile else results_dir / "vendas_7_15_30.json"
-
-    write_json_atomic(payload, out_path)
+    if args.outfile:
+        # respeita caminho explícito do usuário
+        out_path = Path(args.outfile)
+        sink = make_sink("json", output_dir=out_path.parent, filename=out_path.name, keep=2)
+    else:
+        sink = make_sink("json", output_dir=results_dir, filename="vendas_7_15_30.json", keep=2)
+    sink.emit(payload)
 
     # Log simpático no console
-    print(f"[OK] JSON gerado: {out_path}")
+    print(f"[OK] JSON gerado em: {(out_path if args.outfile else (results_dir/'vendas_7_15_30.json'))}")
     print(f"     Lojas: {', '.join(lojas)} | Janelas: {', '.join(map(str, windows))}")
 
 

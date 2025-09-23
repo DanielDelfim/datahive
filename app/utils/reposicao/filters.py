@@ -1,6 +1,7 @@
 # app/utils/reposicao/filters.py
 from __future__ import annotations
 from pathlib import Path
+import re
 from typing import Dict, Any, Iterable, List, Optional
 import json
 
@@ -21,10 +22,44 @@ def _normalize_mlbs(mlbs: Optional[Iterable[str]]) -> Optional[List[str]]:
         return None
     return [str(m).strip() for m in mlbs if str(m).strip()]
 
+_RE_NUM = re.compile(r"\d+")
+
+def _only_digits(s: str) -> str:
+    """Mantém apenas dígitos (útil para comparar GTIN/EAN com ou sem hífens/sufixos)."""
+    return "".join(_RE_NUM.findall(str(s)))
+
+def only_digits(s: str) -> str:
+    """
+    Público: mantém apenas dígitos de uma string.
+    Use em chaves de junção (GTIN/EAN), evitando divergências como '7908812400175-50'.
+    Ex.: only_digits('7908812400175-50') -> '7908812400175'
+    """
+    return _only_digits(s)
+
+    return _only_digits(s)
+
+def _normalize_gtins(gtins: Optional[Iterable[str]]) -> Optional[List[str]]:
+    """
+    Normaliza GTINs: strip + mantém apenas dígitos.
+    Ex.: '7908812400175-50' -> '7908812400175'
+    """
+    if gtins is None:
+        return None
+    out: List[str] = []
+    for g in gtins:
+        s = str(g).strip()
+        if not s:
+            continue
+        only = _only_digits(s)
+        if only:
+            out.append(only)
+    return out or None
+
 def filtrar_payload(
     payload_or_path: Dict[str, Any] | str | Path,
     lojas: Optional[Iterable[str]] = None,
     mlbs: Optional[Iterable[str]] = None,
+    gtins: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """
     Filtra um payload no formato:
@@ -41,6 +76,7 @@ def filtrar_payload(
 
     lojas_norm = _normalize_lojas(lojas)
     mlbs_norm = _normalize_mlbs(mlbs)
+    gtins_norm = _normalize_gtins(gtins)
 
     out: Dict[str, Any] = {"results": {}}
     for loja, mapa in results.items():
@@ -50,11 +86,26 @@ def filtrar_payload(
         if not isinstance(mapa, dict):
             continue
 
-        if mlbs_norm is None:
-            out["results"][loja_key] = mapa
-        else:
-            rec_mlb = {mlb: rec for mlb, rec in mapa.items() if mlb in mlbs_norm}
-            out["results"][loja_key] = rec_mlb
+        # 1) filtro por MLB (se houver)
+        recs = (
+            {mlb: rec for mlb, rec in mapa.items() if mlb in mlbs_norm}
+            if mlbs_norm is not None else dict(mapa)
+        )
+
+        # 2) filtro por GTIN (se houver) — compara usando dígitos apenas
+        if gtins_norm is not None:
+            filtered: Dict[str, Any] = {}
+            for mlb, rec in recs.items():
+                if not isinstance(rec, dict):
+                    continue
+                gt = rec.get("gtin")
+                if gt is None:
+                    continue
+                if _only_digits(str(gt)) in gtins_norm:
+                    filtered[mlb] = rec
+            recs = filtered
+
+        out["results"][loja_key] = recs
 
     # mantém metadados úteis
     for k in ("generated_at", "windows", "lojas"):
@@ -66,12 +117,13 @@ def flatten_filtrado(
     payload_or_path: Dict[str, Any] | str | Path,
     lojas: Optional[Iterable[str]] = None,
     mlbs: Optional[Iterable[str]] = None,
+    gtins: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Retorna lista de linhas (dict) flatten para exportação/relatórios.
     Cada linha contém: loja, mlb e campos calculados.
     """
-    filtered = filtrar_payload(payload_or_path, lojas=lojas, mlbs=mlbs)
+    filtered = filtrar_payload(payload_or_path, lojas=lojas, mlbs=mlbs, gtins=gtins)
     rows: List[Dict[str, Any]] = []
     results = filtered.get("results", {})
     for loja, mapa in results.items():
@@ -83,6 +135,7 @@ def flatten_filtrado(
             row = {
                 "loja": loja,
                 "mlb": mlb,
+                "gtin": rec.get("gtin"),
                 # Vendas brutas por janela
                 "sold_7": rec.get("sold_7"),
                 "sold_15": rec.get("sold_15"),

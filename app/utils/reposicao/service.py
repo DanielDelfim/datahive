@@ -12,8 +12,15 @@ from app.utils.reposicao.aggregator import (
     agregar_por_mlb,
     build_snapshot,
     write_snapshot,
+    consolidar_vendas_por_gtin,
 )
-from app.utils.reposicao.filters import filtrar_payload, flatten_filtrado
+
+from app.utils.reposicao.metrics import (
+    pick_preferred_daily_rate, blended_daily_rate,
+    projections_from_daily, consumo_previsto, reposicao_necessaria,
+)
+from app.utils.estoques_matriz_filial.service import get_estoque_pp_mg
+from app.utils.reposicao.filters import filtrar_payload, flatten_filtrado, only_digits
 
 __all__ = [
     # compat já esperada pelo seu __init__.py
@@ -53,6 +60,76 @@ def salvar_json_atomic(payload: Dict[str, Any], dest: Path) -> Path:
 # -------------------------------------------------
 # API principal / compatibilidade
 # -------------------------------------------------
+def estimativa_por_gtin_matriz(
+    infile: Path | str | None = None,
+    *,
+    arredondar_para_multiplo: float | int | None = None
+) -> Dict[str, Any]:
+    """
+    Consolida SP+MG por GTIN, injeta estoque da MATRIZ (PP MG) e calcula
+    projeções e reposições (30d/60d) com base na taxa PONDERADA 50/30/20.
+    """
+    payload = carregar_payload(infile or (RESULTS_DIR() / "vendas_7_15_30.json"))  # :contentReference[oaicite:29]{index=29}
+    por_gtin = consolidar_vendas_por_gtin(payload)
+
+    # estoque PP matriz (lista normalizada) -> mapa por EAN
+    estoque_rows = get_estoque_pp_mg()  # List[dict] com chaves ean/quantidade  # List[dict] com chaves ean/quantidade :contentReference[oaicite:30]{index=30}
+    estoque_por_ean: Dict[str, float] = {}
+    for r in estoque_rows:
+        ean = only_digits(str(r.get("ean", "")).strip())
+        if not ean:
+            continue
+        try:
+            q = float(r.get("quantidade") or 0)
+        except Exception:
+            q = 0.0
+        estoque_por_ean[ean] = estoque_por_ean.get(ean, 0.0) + q
+
+    out: Dict[str, Any] = {}
+    for gtin_key, v in por_gtin.items():
+        gtin = only_digits(gtin_key)
+        estoque = float(estoque_por_ean.get(gtin, 0.0))
+        daily_pref  = pick_preferred_daily_rate(v)
+        daily_blend = blended_daily_rate(v)  # 50/30/20
+        proj        = projections_from_daily(daily_blend)
+
+        # dentro de estimativa_por_gtin_matriz(...), no loop que monta out[gtin]
+        out[gtin] = {
+            "gtin": gtin,
+            "title": v.get("title", ""),   # <<< garantir inclusão
+            "sold_7": v["sold_7"], "sold_15": v["sold_15"], "sold_30": v["sold_30"],
+            "media_diaria_7": v["media_diaria_7"], "media_diaria_15": v["media_diaria_15"], "media_diaria_30": v["media_diaria_30"],
+            "media_diaria_preferida": daily_pref,
+            "media_diaria_ponderada": daily_blend,
+            "estoque_matriz": estoque,
+            "consumo_previsto_30d": consumo_previsto(daily_blend, 30),
+            "consumo_previsto_60d": consumo_previsto(daily_blend, 60),
+            "reposicao_necessaria_30d": reposicao_necessaria(estoque, daily_blend, 30, arredondar_para_multiplo),
+            "reposicao_necessaria_60d": reposicao_necessaria(estoque, daily_blend, 60, arredondar_para_multiplo),
+            **proj,
+        }
+
+
+    # GTINs que só existem no estoque
+    for gtin, estoque in estoque_por_ean.items():
+        if gtin not in out:
+            out[gtin] = {
+                "gtin": gtin,
+                "sold_7": 0.0, "sold_15": 0.0, "sold_30": 0.0,
+                "media_diaria_7": 0.0, "media_diaria_15": 0.0, "media_diaria_30": 0.0,
+                "media_diaria_preferida": 0.0, "media_diaria_ponderada": 0.0,
+                "estoque_matriz": float(estoque),
+                "consumo_previsto_30d": 0.0, "consumo_previsto_60d": 0.0,
+                "reposicao_necessaria_30d": 0.0, "reposicao_necessaria_60d": 0.0,
+                "expectativa_30d": 0.0, "expectativa_60d": 0.0,
+            }
+
+    return {
+        "fonte_vendas": str(RESULTS_DIR() / "vendas_7_15_30.json"),
+        "fonte_estoque_matriz": "pp:estoque_mg.json",
+        "items": out,
+    }
+
 
 def estimativa_por_mlb(
     loja: str,
@@ -117,6 +194,19 @@ def escrever_datado(
     dest = RESULTS_DIR() / f"{prefixo}__{ts}.json"
     return write_snapshot(payload, dest=dest)
 
+def escrever_reposicao_matriz(
+    infile: Path | str | None = None,
+    outfile: Path | None = None,
+    *,
+    arredondar_para_multiplo: float | int | None = None,
+) -> Path:
+    """
+    Gera e escreve C:\\Apps\\Datahive\\data\\marketplaces\\meli\\reposicao\\results\\reposicao_matriz.json
+    (ou caminho custom via outfile).
+    """
+    payload = estimativa_por_gtin_matriz(infile=infile, arredondar_para_multiplo=arredondar_para_multiplo)
+    dest = outfile or (RESULTS_DIR() / "reposicao_matriz.json")  # novo arquivo pedido
+    return salvar_json_atomic(payload, dest)  # já existente na service.py :contentReference[oaicite:31]{index=31}
 
 # -------------------------------------------------
 # Exportações (recortes por loja/MLB)

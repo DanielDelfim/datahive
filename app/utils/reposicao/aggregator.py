@@ -10,6 +10,9 @@ from app.services.vendas_service import get_por_mlb
 from app.utils.anuncios.service import obter_anuncio_por_mlb
 from app.utils.reposicao.config import RESULTS_DIR
 
+from collections import defaultdict, Counter
+from app.utils.reposicao.filters import only_digits
+
 from app.utils.reposicao.metrics import (
     daily_rates_from_windows,
     pick_preferred_daily_rate,
@@ -236,3 +239,56 @@ def write_snapshot(
         json.dump(payload, f, ensure_ascii=False, indent=2)
     tmp.replace(dest)
     return dest
+
+
+def consolidar_vendas_por_gtin(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Soma SP+MG por GTIN a partir de vendas_7_15_30.json e elege um 'title' representativo.
+    Retorno: { gtin: {title, sold_7, sold_15, sold_30, media_diaria_7,15,30} }
+    """
+    results = (payload or {}).get("results", {}) or {}
+    acc: Dict[str, Dict[str, float]] = {}
+    titles: Dict[str, Counter] = defaultdict(Counter)
+
+    def _sold_in(rec: Dict[str, Any], w: int) -> float:
+        win = (rec.get("windows") or {}).get(w) or (rec.get("windows") or {}).get(str(w)) or {}
+        try:
+            return float(win.get("qty_total", 0) or 0)
+        except Exception:
+            return 0.0
+
+    for loja, mapa in results.items():  # "sp"/"mg"
+        if not isinstance(mapa, dict):
+            continue
+        for _mlb, rec in mapa.items():
+            if not isinstance(rec, dict):
+                continue
+            gtin_raw = str(rec.get("gtin") or "").strip()
+            gtin = only_digits(gtin_raw)
+            if not gtin:
+                continue
+
+            cur = acc.setdefault(gtin, {"sold_7": 0.0, "sold_15": 0.0, "sold_30": 0.0})
+            cur["sold_7"]  += _sold_in(rec, 7)
+            cur["sold_15"] += _sold_in(rec, 15)
+            cur["sold_30"] += _sold_in(rec, 30)
+
+            # coleta possíveis títulos de várias fontes
+            t = (
+                rec.get("title")
+                or (rec.get("raw") or {}).get("title")
+                or (rec.get("raw") or {}).get("nome")
+                or rec.get("nome")
+                or (rec.get("raw") or {}).get("name")
+                or rec.get("name")
+                or ""
+            ).strip()
+            if t:
+                titles[gtin][t] += 1
+
+    # médias diárias + escolha do título
+    for gtin, v in acc.items():
+        v.update(daily_rates_from_windows({7: v["sold_7"], 15: v["sold_15"], 30: v["sold_30"]}))
+        v["title"] = titles[gtin].most_common(1)[0][0] if titles.get(gtin) else ""
+
+    return acc
