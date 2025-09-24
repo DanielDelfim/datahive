@@ -160,6 +160,51 @@ def _extract_logistic_type(item: Dict[str, Any]) -> Optional[str]:
     lt = ship.get("logistic_type")
     return lt.strip() if isinstance(lt, str) else None
 
+def _parse_number_from_text(s: Optional[str]) -> Optional[float]:
+    """Extrai primeiro número decimal de uma string (ex.: '34.44 BRL' -> 34.44)."""
+    if not isinstance(s, str):
+        return None
+    m = re.search(r"([0-9]+(?:[.,][0-9]+)?)", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "."))
+    except Exception:
+        return None
+
+def _extract_rebate_price(item: Dict[str, Any]) -> Optional[float]:
+    """
+    Procura em sale_terms a entrada ALL_METHODS_REBATE_PRICE e retorna o número (BRL).
+    Prioriza value_struct.number; fallbacks: values[].struct.number ou parse de value_name.
+    """
+    sts = item.get("sale_terms") or []
+    if not isinstance(sts, list):
+        return None
+    for st in sts:
+        if not isinstance(st, dict):
+            continue
+        sid = str(st.get("id") or "").upper()
+        if sid == "ALL_METHODS_REBATE_PRICE":
+            vs = st.get("value_struct") or {}
+            n = vs.get("number")
+            if n is not None:
+                try:
+                    return float(n)
+                except Exception:
+                    pass
+            vals = st.get("values") or []
+            if isinstance(vals, list) and vals:
+                vstruct = vals[0].get("struct") or {}
+                n2 = vstruct.get("number")
+                if n2 is not None:
+                    try:
+                        return float(n2)
+                    except Exception:
+                        pass
+            return _parse_number_from_text(st.get("value_name"))
+    return None
+
+
 # --------------------- preprocess lista --------------------- #
 def preprocess_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -174,6 +219,7 @@ def preprocess_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "estoque": _extract_available_qty(it),
             "price": price,
             "original_price": original_price,
+            "rebate_price": _extract_rebate_price(it),
             "status": _extract_status(it),
             "logistic_type": _extract_logistic_type(it),
         })

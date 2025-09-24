@@ -1,0 +1,76 @@
+canal: meli
+
+default:
+  imposto_pct: 0.09
+  marketing_pct: 0.07
+  frete_pct_sobre_custo: 0.05
+  mcp_min: 0.10
+  mcp_max: 0.25
+
+comissao:
+  classico_pct: 0.14
+
+full:
+  custo_fixo_por_unidade_brl:
+    - { max_preco: 19.99, valor: 1.00 }
+    - { max_preco: 39.99, valor: 2.00 }
+    - { max_preco: 79.99, valor: 4.00 }
+    - { max_preco: 199.99, valor: 6.00 }
+    - { otherwise: true, valor: 0.00 }
+
+nao_full:
+  # custo fixo padrão quando NÃO atingir o threshold de frete grátis
+  custo_fixo_por_unidade_brl:
+    - { max_preco: 12.49, valor_pct_do_preco: 0.50 }  # metade do preço
+    - { max_preco: 29.00, valor: 6.25 }
+    - { max_preco: 50.00, valor: 6.50 }
+    - { max_preco: 79.00, valor: 6.75 }
+    - { otherwise: true, valor: 0.00 }
+
+  # Frete grátis quando preço >= threshold (79.00)
+  frete_gratis_40538:
+    threshold_preco_brl: 79.00
+    tabelas_por_preco:
+
+      # Produtos novos de R$ 79 a R$ 99,99
+      "79-99.99":
+        - { max_kg: 0.30, valor: 11.97 }
+        - { max_kg: 0.50, valor: 12.87 }
+        - { max_kg: 1.00, valor: 13.47 }
+        - { max_kg: 2.00, valor: 14.07 }
+
+      # Produtos novos de R$ 100 a R$ 119,99
+      "100-119.99":
+        - { max_kg: 0.30, valor: 13.97 }
+        - { max_kg: 0.50, valor: 15.02 }
+        - { max_kg: 1.00, valor: 15.72 }
+        - { max_kg: 2.00, valor: 16.42 }
+
+      # Produtos novos de R$ 120 a R$ 149,99
+      "120-149.99":
+        - { max_kg: 0.30, valor: 15.96 }
+        - { max_kg: 0.50, valor: 17.16 }
+        - { max_kg: 1.00, valor: 17.96 }
+        - { max_kg: 2.00, valor: 18.76 }
+
+      # Produtos novos de R$ 150 a R$ 199,99
+      "150-199.99":
+        - { max_kg: 0.30, valor: 17.96 }
+        - { max_kg: 0.50, valor: 19.31 }
+        - { max_kg: 1.00, valor: 20.21 }
+        - { max_kg: 2.00, valor: 21.11 }
+        - { max_kg: 3.00, valor: 22.46 }
+        - { max_kg: 4.00, valor: 24.26 }
+        - { max_kg: 5.00, valor: 25.61 }
+        - { max_kg: 9.00, valor: 40.01 }
+
+      # Produtos novos de mais de R$ 200
+      ">200":
+        - { max_kg: 0.30, valor: 19.95 }
+        - { max_kg: 0.50, valor: 21.45 }
+        - { max_kg: 1.00, valor: 22.45 }
+        - { max_kg: 2.00, valor: 23.45 }
+        - { max_kg: 3.00, valor: 24.95 }
+        - { max_kg: 4.00, valor: 26.95 }
+        - { max_kg: 5.00, valor: 28.45 }
+        - { max_kg: 9.00, valor: 44.45 }

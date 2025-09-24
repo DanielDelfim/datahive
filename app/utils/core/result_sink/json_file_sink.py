@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from app.config.paths import backup_path, atomic_write_json  # helpers exigidos
+from app.utils.core.io import atomic_write_json
+from app.config.paths import backup_path # função transversal para backup
 
 
 def _sanitize_filename_part(s: str) -> str:
@@ -58,28 +59,34 @@ class JsonFileSink:
 
     def _rotate_backups(self, target: Path) -> None:
         """
-        Mantém no máx. 'keep' backups para o arquivo 'target'.
-
-        Suposição: backup_path(target) devolve um diretório ou caminho
-        padronizado onde os backups são criados por atomic_write_json().
-        Aqui listamos e aplicamos política LRU simples por data de modificação.
+        Mantém no máx. 'keep' backups conforme a **política vigente do projeto**:
+        - `backup_path(target)` define **onde** os backups vivem.
+        - Aqui listamos o **diretório de backups** e aplicamos LRU por mtime.
         """
-        bkp_dir = Path(backup_path(target))
+        # Onde a política aponta para o backup alvo
+        bkp_example = Path(backup_path(target))
+        bkp_dir = bkp_example.parent
         if not bkp_dir.exists() or not bkp_dir.is_dir():
             return
 
-        # Critério: arquivos que começam com o stem do target
-        stem = target.stem  # ex.: results_mg
-        candidates = sorted(
-            [p for p in bkp_dir.iterdir() if p.is_file() and p.name.startswith(stem)],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        # Mantém 'keep' mais recentes; remove o restante
-        for old in candidates[self.keep :]:
+        stem = target.stem
+        suffix = target.suffix
+
+        candidates = []
+        try:
+            for p in bkp_dir.iterdir():
+                if not p.is_file():
+                    continue
+                name = p.name
+                # Critério amplo: mesmo stem e mesmo sufixo (permite timestamps no nome)
+                if name.startswith(stem) and name.endswith(suffix):
+                    candidates.append(p)
+        except Exception:
+            return
+
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in candidates[self.keep:]:
             try:
                 old.unlink(missing_ok=True)
             except Exception:
-                # Evita quebrar execução por erro de permissão/bloqueio: log simples
-                # (o script chamador pode ter logger próprio)
                 print(f"[WARN] Falha ao remover backup antigo: {old}")
