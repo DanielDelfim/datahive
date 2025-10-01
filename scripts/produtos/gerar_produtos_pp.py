@@ -25,6 +25,8 @@ from app.utils.produtos.config import (
 )
 from app.utils.produtos.aggregator import carregar_excel_normalizado_detalhado
 
+from app.utils.produtos.config import get_paths
+excel_path = get_paths().excel  # agora aponta para data/produtos/excel/cadastro_produtos_template.xlsx
 
 def build_payload() -> Dict[str, Any]:
     """
@@ -42,7 +44,7 @@ def build_payload() -> Dict[str, Any]:
     return payload, skipped
 
 
-def write_payload(payload: Dict[str, Any], skipped: list) -> str:
+def write_payload(payload: Dict[str, Any], skipped: list, *, to_file: bool, to_stdout: bool, keep: int, filename: str) -> str:
     """
     Emite o payload usando JsonFileSink (result_sink) para o diretório PP do módulo.
     Retorna o caminho final (str) para conveniência de logs.
@@ -50,20 +52,22 @@ def write_payload(payload: Dict[str, Any], skipped: list) -> str:
     out_dir = produtos_dir(Camada.PP)
     out_path = produtos_json(Camada.PP)  # apenas para log; o sink também salva neste dir
     sink = resolve_sink_from_flags(
-        to_file=True,
+        to_file=to_file,
+        to_stdout=to_stdout,
         output_dir=out_dir,
         prefix="produtos",
-        keep=3,
-        filename="produtos.json",
+        keep=keep,
+        filename=filename,
     )
     sink.emit(payload)
     # Relatório de ignorados
-    if skipped:
+    if skipped and to_file:
         skipped_sink = resolve_sink_from_flags(
-            to_file=True,
+            to_file=to_file,
+            to_stdout=False,
             output_dir=out_dir,
             prefix="produtos_skipped",
-            keep=5,
+            keep=max(keep, 5),
             filename="produtos_skipped.json",
         )
         skipped_sink.emit({"count": len(skipped), "items": skipped})
@@ -72,9 +76,23 @@ def write_payload(payload: Dict[str, Any], skipped: list) -> str:
 
 def main() -> int:
     try:
+        import argparse
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--to-file", dest="to_file", action="store_true", default=True)
+        ap.add_argument("--no-to-file", dest="to_file", action="store_false")
+        ap.add_argument("--stdout", dest="to_stdout", action="store_true", default=True)
+        ap.add_argument("--no-stdout", dest="to_stdout", action="store_false")
+        ap.add_argument("--keep", type=int, default=3, help="Qtde de backups a manter")
+        ap.add_argument("--filename", type=str, default="produtos.json")
+        args = ap.parse_args()
+
         payload, skipped = build_payload()
-        final_path = write_payload(payload, skipped)
-        print(f"[OK] Produtos PP → {final_path} (itens: {payload['count']}, ignorados: {payload.get('skipped_count', 0)})")
+        final_path = write_payload(
+            payload, skipped,
+            to_file=args.to_file, to_stdout=args.to_stdout,
+            keep=args.keep, filename=args.filename
+        )
+        print(f"[OK] Produtos PP -> {final_path} (itens: {payload['count']}, ignorados: {payload.get('skipped_count', 0)})")
         # Log amigável dos ignorados (até 10 linhas)
         if skipped:
             print("\n[INFO] Produtos ignorados (primeiros 10):")

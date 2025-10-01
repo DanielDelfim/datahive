@@ -7,6 +7,8 @@ from typing import Iterable, List, Dict, Any, Tuple, Optional
 
 from app.config.paths import APP_TIMEZONE
 
+import pandas as pd
+
 __all__ = [
     "now_iso",
     "today_bounds",
@@ -20,7 +22,6 @@ __all__ = [
 ]
 
 # ---------- PARSE ISO ----------
-
 def _parse_iso(s: Optional[str]) -> Optional[datetime]:
     """Converte ISO (aceita Z e milisseg.) em datetime tz-aware; assume UTC se naive."""
     if not s:
@@ -38,6 +39,39 @@ def _parse_iso(s: Optional[str]) -> Optional[datetime]:
     return dt
 
 # ---------- BOUNDS ----------
+def dentro_janela(df: pd.DataFrame, col_data: str, inicio: str, fim: str) -> pd.DataFrame:
+    """Filtra linhas cuja data (col_data) intersecta [inicio, fim] (YYYY-MM-DD)."""
+    if col_data not in df.columns:
+        return df.iloc[0:0].copy()
+    s = pd.to_datetime(df[col_data], errors="coerce", dayfirst=True)
+    # garantir timezone-naive
+    try:
+        s = s.dt.tz_localize(None)
+    except Exception:
+        pass
+    ini = pd.to_datetime(inicio).date()
+    end = pd.to_datetime(fim).date()
+    # mantemos linhas com data dentro do intervalo
+    m = (s.dt.date >= ini) & (s.dt.date <= end)
+    return df.loc[m].copy()
+
+def dentro_competencia(df: pd.DataFrame, col_data: str, ano: int, mes: int) -> pd.DataFrame:
+    if col_data not in df.columns:
+        return df.iloc[0:0].copy()
+    # 1) Parse robusto: tenta com dayfirst=True e False e escolhe o que tiver mais válidos
+    s_br = pd.to_datetime(df[col_data], errors="coerce", dayfirst=True)
+    s_us = pd.to_datetime(df[col_data], errors="coerce", dayfirst=False)
+    # escolhe a série com menos NaT (mais parseada)
+    use_br = s_br.notna().sum() >= s_us.notna().sum()
+    s = s_br if use_br else s_us
+    # 2) Remover timezone (se presente)
+    try:
+        s = s.dt.tz_localize(None)
+    except Exception:
+        pass
+    # 3) Filtrar competência alvo
+    m = (s.dt.year == ano) & (s.dt.month == mes)
+    return df.loc[m].copy()
 
 def now_iso(tz_name: str = APP_TIMEZONE) -> str:
     tz = ZoneInfo(tz_name)

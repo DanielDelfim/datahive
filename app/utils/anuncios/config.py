@@ -1,43 +1,27 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Literal
-from app.config.paths import DATA_DIR  # fonte única de paths
+from app.config.paths import (
+    anuncios_json, Marketplace, Camada, Regiao, DATA_DIR
+)
 
 RegiaoStr = Literal["mg", "sp"]
 
+# Mantido para consumo externo; usado pelo script de atualização.
 RETENCAO_BACKUPS = 2
 
-def base_dir() -> Path:
-    # data/marketplaces/meli/anuncios/
-    return (DATA_DIR / "marketplaces" / "meli" / "anuncios")
-
-def raw_dir() -> Path:
-    d = base_dir() / "raw"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-def pp_dir() -> Path:
-    d = base_dir() / "pp"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-def backups_dir() -> Path:
-    d = base_dir() / "backups"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
+# (Opcional) diretórios auxiliares não-críticos do domínio de anúncios.
 def cache_xml_dir() -> Path:
-    # reservado para caches de descrições/imagens, se necessário
-    d = base_dir() / "cache_xml"
+    d = (DATA_DIR / "marketplaces" / "meli" / "anuncios" / "cache_xml")
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 def RAW_PATH(regiao: RegiaoStr) -> Path:
-    return raw_dir() / f"anuncios_{regiao.lower()}_raw.json"
+    """Delegado aos paths centralizados (fonte única)."""
+    return anuncios_json(Marketplace.MELI, Camada.RAW, Regiao(regiao))
 
 def PP_PATH(regiao: RegiaoStr) -> Path:
-    return pp_dir() / f"anuncios_{regiao.lower()}_pp.json"
+    """Delegado aos paths centralizados (fonte única)."""
+    return anuncios_json(Marketplace.MELI, Camada.PP, Regiao(regiao))
 
-# atalhos requisitados pelo enunciado
-BACKUPS_DIR = backups_dir()
 CACHE_XML_DIR = cache_xml_dir()

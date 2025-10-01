@@ -1,0 +1,26 @@
+# Conceitos (regex/substring) → categoria “Sua fatura inclui”
+# A ordem importa: a primeira que casar leva.
+- match: "(?i)tarifa de venda|comiss"
+  bucket: "Tarifas de venda"
+
+- match: "(?i)custo de gest[aã]o|gestao da venda|gestão da venda"
+  bucket: "Tarifas dos serviços do Mercado Pago"
+
+- match: "(?i)parcelament"
+  bucket: "Taxas de parcelamento"
+
+- match: "(?i)envio|etiqueta"
+  exclude: "(?i)full"
+  bucket: "Tarifas de envios no Mercado Livre"
+
+- match: "(?i)full|armazen"
+  bucket: "Tarifas de envios Full"
+
+- match: "(?i)publicidade|\\bads\\b"
+  bucket: "Tarifas por campanha de publicidade"
+
+- match: "(?i)minha p[aá]gina"
+  bucket: "Tarifas da Minha página"
+
+- match: "(?i)estorno|cancel"
+  bucket: "Cancelamentos de tarifas"
