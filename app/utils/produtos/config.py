@@ -14,12 +14,16 @@ from typing import List, Dict, Set
 from pathlib import Path
 
 # Itens transversais (fonte única em app/config/paths.py)
-from app.config.paths import BASE_PATH, DATA_DIR, Camada
+from app.config.paths import DATA_DIR, Camada
 
 # ===== PATHS DO MÓDULO (AQUI) =====
 def cadastro_produtos_excel() -> Path:
-    """Excel fica na raiz do Datahive."""
-    return Path(BASE_PATH) / "cadastro_produtos_template.xlsx"
+    """
+    Excel oficial de cadastro de produtos.
+    Mantemos o caminho derivado de DATA_DIR para seguir a diretriz de paths centralizados:
+    data/produtos/excel/cadastro_produtos_template.xlsx
+    """
+    return Path(DATA_DIR) / "produtos" / "excel" / "cadastro_produtos_template.xlsx"
 
 def produtos_dir(camada: Camada = Camada.PP) -> Path:
     return Path(DATA_DIR) / "produtos" / camada.value

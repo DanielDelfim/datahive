@@ -1,4 +1,3 @@
-# app/utils/meli/api.py
 from __future__ import annotations
 
 import json
@@ -128,3 +127,51 @@ class MeliClient:
         r = self._get(f"/items/{mlb}/description")
         r.raise_for_status()
         return r.json()
+    
+    def search_seller_items(self, seller_id: str, limit: int = 100, max_pages: int = 1000) -> List[str]:
+        """
+        Retorna todos os MLBs do seller usando /users/{seller_id}/items/search (scan).
+        """
+        path = f"/users/{seller_id}/items/search"
+        params = {"search_type": "scan", "limit": limit, "offset": 0}
+        ids: List[str] = []
+        page = 0
+        while True:
+            r = self._get(path, params)
+            r.raise_for_status()
+            data = r.json() or {}
+            results = data.get("results") or []
+            if not results:
+                break
+            ids.extend(results)
+            params["offset"] = int(params["offset"]) + limit
+            page += 1
+            if page >= max_pages:
+                break
+            paging = data.get("paging") or {}
+            total = int(paging.get("total") or 0)
+            if total and len(ids) >= total:
+                break
+        return ids
+
+    def get_items_bulk(self, ids: List[str]) -> List[Dict[str, Any]]:
+        """
+        Busca detalhes dos itens em lotes via /items?ids=...
+        """
+        out: List[Dict[str, Any]] = []
+        step = 20
+        for i in range(0, len(ids), step):
+            chunk = ids[i:i+step]
+            if not chunk:
+                continue
+            r = self._get("/items", params={"ids": ",".join(chunk)})
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                for it in data:
+                    body = it.get("body") if isinstance(it, dict) else None
+                    if body:
+                        out.append(body)
+            elif isinstance(data, dict) and data.get("body"):
+                out.append(data["body"])
+        return out

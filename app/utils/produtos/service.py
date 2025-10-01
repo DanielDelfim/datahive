@@ -7,7 +7,22 @@ from typing import Any, Dict, Optional
 
 from app.config.paths import Camada
 from app.utils.produtos.config import produtos_json, cadastro_produtos_excel
-from app.utils.produtos import mapeadores
+
+# Import resiliente do módulo de mapeamento:
+# 1) nome atual "mappers"
+# 2) nome legado "mapeadores"
+# 3) fallback relativo quando executado como pacote
+try:
+    from app.utils.produtos import mappers as mapeadores  # nome local padronizado
+except ImportError:
+    try:
+        from app.utils.produtos import mapeadores  # legado
+    except ImportError:
+        try:
+            from . import mappers as mapeadores  # relativo
+        except ImportError:
+            from . import mapeadores  # relativo (legado)
+
 from app.utils.produtos.aggregator import carregar_excel_normalizado
 
 

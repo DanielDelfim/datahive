@@ -80,6 +80,8 @@ class Regiao(str, Enum):
 class Camada(str, Enum):
     RAW = "raw"
     PP = "pp"
+    EXCEL = "excel"
+    RESULTS = "results"
 
 # --------------------------- Variáveis de ambiente ------------------------
 BASE_PATH   = _expand_path(os.getenv("BASE_PATH", r"C:/Apps/Datahive")) or Path(r"C:/Apps/Datahive")
