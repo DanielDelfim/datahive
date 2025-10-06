@@ -1,8 +1,42 @@
 from __future__ import annotations
 import json
+from pathlib import Path
 from typing import List, Dict, Any
 from .config import PP_PATH
 from .schemas import PPAnuncio, validate_envelope
+
+from app.config.paths import Regiao
+from . import config as ancfg  # deve expor RAW_PATH(regiao: str) -> Path
+
+def _norm_regiao(r: Regiao | str | None) -> str:
+    if isinstance(r, Regiao):
+        return r.value.lower()
+    if r is None:
+        return ""  # deixa vazio; RAW_PATH deve lidar (ou o caller passa uma válida)
+    return str(r).strip().lower()
+
+def _read_json(p: Path) -> Any:
+    with p.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+def carregar_raw(regiao: Regiao | str | None) -> list[dict]:
+    reg = _norm_regiao(regiao)
+    path: Path = ancfg.RAW_PATH(reg)  # RAW_PATH("sp"/"mg"/...)
+    if not path.exists():
+        return []
+
+    payload = _read_json(path)
+    if isinstance(payload, dict):
+        for key in ("results", "data", "items", "anuncios"):
+            arr = payload.get(key)
+            if isinstance(arr, list):
+                return arr
+        if "id" in payload:
+            return [payload]
+        return []
+    if isinstance(payload, list):
+        return payload
+    return []
 
 def _carregar_pp(regiao: str) -> List[PPAnuncio]:
     """
@@ -26,6 +60,24 @@ def _carregar_raw(regiao: str) -> Dict[str, Any]:
     from .config import RAW_PATH
     p = RAW_PATH(regiao.lower())
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+def _get_rebate_all_methods(item: dict) -> tuple[float | None, str | None]:
+    terms = item.get("sale_terms") or []
+    for t in terms:
+        if t.get("id") == "ALL_METHODS_REBATE_PRICE":
+            vs = t.get("value_struct") or {}
+            num = vs.get("number")
+            cur = vs.get("unit") or "BRL"
+            # fallback: se não houver struct, tentar value_name "31.04 BRL"
+            if num is None and (vn := t.get("value_name")):
+                parts = vn.split()
+                try:
+                    num = float(parts[0].replace(",", "."))
+                    cur = parts[1] if len(parts) > 1 else "BRL"
+                except Exception:
+                    pass
+            return (num, cur)
+    return (None, None)
 
 def _normalizar_raw_para_pp(raw_payload: Dict[str, Any]) -> List[PPAnuncio]:
     """

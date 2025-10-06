@@ -1,10 +1,15 @@
-# app/dashboard/precificacao/__init__.py
+from __future__ import annotations
 import streamlit as st
-from .abas import resumo, anuncios
+from .tabs import resumo, anuncios
 
-def render_dashboard_precificacao(ctx) -> None:
-    tabs = st.tabs(["📊 Resumo", "🧾 Anúncios"])
-    with tabs[0]:
-        resumo.render(ctx)
-    with tabs[1]:
-        anuncios.render(ctx)
+TABS = {
+    "Resumo": resumo.render,
+    "Anúncios": anuncios.render,
+}
+
+def render_dashboard_precificacao(ctx: dict) -> None:
+    tab_labels = list(TABS.keys())
+    tab_objects = st.tabs(tab_labels)
+    for tab, label in zip(tab_objects, tab_labels):
+        with tab:
+            TABS[label](ctx)

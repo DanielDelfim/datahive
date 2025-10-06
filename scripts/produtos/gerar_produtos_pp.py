@@ -13,8 +13,12 @@ Regra de ouro:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 from typing import Dict, Any
+
+from datetime import datetime, timezone
 
 from app.config.paths import Camada  # transversal (Enums)
 from app.utils.core.result_sink.service import resolve_sink_from_flags
@@ -23,22 +27,42 @@ from app.utils.produtos.config import (
     produtos_dir,
     produtos_json,
 )
-from app.utils.produtos.aggregator import carregar_excel_normalizado_detalhado
+from app.utils.produtos.service import normalizar_excel_detalhado
 
 from app.utils.produtos.config import get_paths
 excel_path = get_paths().excel  # agora aponta para data/produtos/excel/cadastro_produtos_template.xlsx
 
+MARKETPLACE = "site"  # ou "meli" se preferir
+REGIAO = None  # Produtos PP é transversal; pode ser "br" ou None
+SCHEMA_VERSION = "1.0.0"
+SCRIPT_NAME = "scripts/produtos/gerar_produtos_pp.py"
+SCRIPT_VERSION = "1.0.0"
+
+def _stable_hash(items: dict) -> str:
+    ordered = json.dumps(items, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(ordered).hexdigest()
+
 def build_payload() -> Dict[str, Any]:
-    """
-    Carrega o Excel, normaliza em memória e devolve o payload pronto
-    para escrita no JSON PP.
-    """
-    excel_path = cadastro_produtos_excel()
-    registros, skipped = carregar_excel_normalizado_detalhado(excel_path)
+    registros, skipped = normalizar_excel_detalhado()  # via service (ver item 1)
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     payload: Dict[str, Any] = {
+        "_meta": {
+            "generated_at_utc": now,
+            "stage": "dev",
+            "marketplace": MARKETPLACE,
+            "regiao": REGIAO,
+            "camada": Camada.PP.value,
+            "schema_version": SCHEMA_VERSION,
+            "script_name": SCRIPT_NAME,
+            "script_version": SCRIPT_VERSION,
+            "source_paths": [cadastro_produtos_excel()],  # caminho do Excel
+            "row_count": len(registros),
+            "hash": _stable_hash(registros),
+            "warnings": [],
+        },
         "count": len(registros),
-        "source": str(excel_path),
-        "items": registros,
+        "source": str(cadastro_produtos_excel()),
+        "items": dict(sorted(registros.items())),  # determinismo (ver item 4)
         "skipped_count": len(skipped),
     }
     return payload, skipped

@@ -1,516 +1,470 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
-import re
+import json
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple, Union
+from app.utils.precificacao.filters import is_item_full
 
-from app.config.paths import Regiao
-from app.utils.core.io import ler_json as read_json
-from .config import (
-    get_regras_ml,
-    produtos_pp_candidates,
-    anuncios_pp_candidates_meli,
+from app.utils.precificacao.simulator import simular_mcp_item
+
+from app.utils.precificacao.validators import anexar_warnings_mcp
+
+from app.config.paths import (
+    Marketplace,
+    Regiao,
+    Camada,
+    atomic_write_json,
+    Stage,
 )
-from .metrics import calcular_componentes
+
+from app.utils.precificacao.config import (
+    Periodo,
+    get_precificacao_dataset_path,
+    get_precificacao_metrics_path,
+    get_anuncios_pp_path,
+    get_produtos_pp_path,
+    get_regras_meli_yaml_path,
+)
+
+# Services adjacentes
+from app.utils.anuncios.service import listar_anuncios_pp, validar_integridade_pp
+from app.utils.produtos.service import get_indices as get_indices_produtos
+
+# Métricas/cálculos puros
+from app.utils.precificacao.metrics import calcular_metricas_item, agregar_metricas_documento
 
 
-# =========================================================
-# Utilitários de parsing
-# =========================================================
+# ==== Result Sink (tolerante a layout) ====
+JsonFileSink = StdoutSink = MultiSink = None  # type: ignore
 
-_RECORD_HINT_KEYS = {"id", "mlb", "sku", "gtin", "title", "price", "preco", "preco_venda"}
+# Tentativa 1: contrato centralizado em service.py
+try:
+    from app.utils.core.result_sink.service import JsonFileSink as _JFS, StdoutSink as _SS, MultiSink as _MS  # type: ignore
+    JsonFileSink, StdoutSink, MultiSink = _JFS, _SS, _MS
+except Exception:
+    pass
 
-def _looks_like_record(d: Mapping[str, Any]) -> bool:
-    return any(k in d for k in _RECORD_HINT_KEYS)
-
-def _extract_dicts(obj: Any, out: List[Dict[str, Any]], _depth: int = 0, _max_depth: int = 6) -> None:
-    """Extrai recursivamente dicts “folha” de estruturas (listas/dicts) arbitrárias."""
-    if _depth > _max_depth or obj is None:
-        return
-    if isinstance(obj, list):
-        for el in obj:
-            _extract_dicts(el, out, _depth + 1, _max_depth)
-        return
-    if isinstance(obj, Mapping):
-        if _looks_like_record(obj):
-            out.append(dict(obj))
-            return
-        for v in obj.values():
-            _extract_dicts(v, out, _depth + 1, _max_depth)
-        return
-    # Demais tipos: ignorar
-
-
-def _iter_registros(seq_or_map: Any) -> Iterable[Dict[str, Any]]:
-    """Itera registros quando já estiver “achatado” em lista ou dict."""
-    if isinstance(seq_or_map, Mapping):
-        for v in seq_or_map.values():
-            if isinstance(v, Mapping):
-                yield dict(v)
-    elif isinstance(seq_or_map, Iterable) and not isinstance(seq_or_map, (str, bytes)):
-        for v in seq_or_map:
-            if isinstance(v, Mapping):
-                yield dict(v)
-
-
-# =========================================================
-# Match Produto ↔ Anúncio
-# =========================================================
-
-def _normalize_sku(s: Any) -> str:
-    s = str(s or "").strip()
-    if not s:
-        return ""
-    # remove sufixo após "-", por ex. "7898915380026-2" → "7898915380026"
-    return re.split(r"[\s\-]", s)[0]
-
-def _build_index_produtos(produtos: Iterable[Mapping[str, Any]]) -> Dict[str, Mapping[str, Any]]:
-    idx: Dict[str, Mapping[str, Any]] = {}
-    for p in produtos:
-        sku = str(p.get("sku") or "").strip()
-        gtin = str(p.get("gtin") or "").strip()
-        if sku:
-            idx[f"sku:{sku}"] = p
-            # também indexa sku normalizado (se diferente)
-            sku_n = _normalize_sku(sku)
-            if sku_n and sku_n != sku:
-                idx[f"sku:{sku_n}"] = p
-        if gtin:
-            idx[f"gtin:{gtin}"] = p
-    return idx
-
-def _candidate_keys_from_gtin_field(gtin_field: Any) -> List[str]:
-    """Alguns anúncios trazem GTINs concatenados. Extraímos substrings numéricas (8–14)."""
-    s = re.sub(r"\D", "", str(gtin_field or ""))
-    keys: List[str] = []
-    n = len(s)
-    for L in range(14, 7, -1):  # tenta maiores primeiro
-        for i in range(0, n - L + 1):
-            keys.append(s[i:i+L])
-    return keys
-
-def _match_produto(idx: Mapping[str, Mapping[str, Any]], anuncio: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
-    # 1) sku direto → sku normalizado
-    sku = (anuncio.get("sku") or "").strip()
-    if sku and f"sku:{sku}" in idx:
-        return idx[f"sku:{sku}"]
-    sku_n = _normalize_sku(sku)
-    if sku_n and f"sku:{sku_n}" in idx:
-        return idx[f"sku:{sku_n}"]
-
-    # 2) gtin direto
-    gtin = (anuncio.get("gtin") or "").strip()
-    if gtin and f"gtin:{gtin}" in idx:
-        return idx[f"gtin:{gtin}"]
-
-    # 3) substrings numéricas dentro do campo gtin
-    for sub in _candidate_keys_from_gtin_field(gtin):
-        if f"gtin:{sub}" in idx:
-            return idx[f"gtin:{sub}"]
-        if f"sku:{sub}" in idx:
-            return idx[f"sku:{sub}"]
-
-    # 4) substrings numéricas dentro do campo sku (quando sku contém sufixos mais complexos)
-    for sub in _candidate_keys_from_gtin_field(sku):
-        if f"sku:{sub}" in idx:
-            return idx[f"sku:{sub}"]
-        if f"gtin:{sub}" in idx:
-            return idx[f"gtin:{sub}"]
-
-    return None
-
-
-# =========================================================
-# Extração de campos e flags
-# =========================================================
-
-def _is_full(anuncio: Mapping[str, Any]) -> bool:
-    if anuncio.get("fulfillment") is True:
-        return True
-    if anuncio.get("is_full") is True:
-        return True
-    if str(anuncio.get("logistic_type", "")).lower() in {"fulfillment", "fulfillment_center"}:
-        return True
-    return False
-
-def _preco_venda(anuncio: Mapping[str, Any]) -> Optional[float]:
-    # Prioridade: rebate_price > price > (fallbacks antigos)
-    for k in ("rebate_price", "price", "sale_price", "preco", "preco_venda"):
-        if k in anuncio and anuncio[k] is not None:
-            try:
-                return float(anuncio[k])
-            except (TypeError, ValueError):
-                continue
-    return None
-
-def _subsidio_tarifa(anuncio: Mapping[str, Any]) -> float:
-    """
-    Subsídio de tarifa concedido pelo ML quando há rebate:
-      subsidio = max(price - rebate_price, 0)
-    Retorna 0.0 quando rebate_price não existir/for nulo.
-    """
+# Tentativa 2: módulos separados
+if JsonFileSink is None:
     try:
-        price = float(anuncio.get("price", 0) or 0)
-        rebate = anuncio.get("rebate_price", None)
-        if rebate is None:
-            return 0.0
-        rebate = float(rebate)
-        return max(price - rebate, 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-
-def _sku_normalizado(s: Any) -> str:
-    s = str(s or "").strip()
-    if not s:
-        return ""
-    # remove sufixos (ex.: "7898915380927-2" -> "7898915380927")
-    for sep in (" ", "-"):
-        if sep in s:
-            return s.split(sep, 1)[0]
-    return s
-
-def _custo_do_produto(produto: Optional[Mapping[str, Any]]) -> Optional[float]:
-    if not produto:
-        return None
-    for k in ("custo", "preco_custo", "cost", "preco_compra"):
-        if k in produto and produto[k] is not None:
-            try:
-                return float(produto[k])
-            except (TypeError, ValueError):
-                continue
-    return None
-
-def _peso_em_kg(produto: Mapping[str, Any]) -> float:
-    # estrutura aninhada do seu catálogo: pesos_g.{bruto, liq} — os valores estão em kg
-    try:
-        pesos_g = produto.get("pesos_g") or {}
-        if isinstance(pesos_g, Mapping):
-            if pesos_g.get("bruto") is not None:
-                return float(pesos_g["bruto"])
-            if pesos_g.get("liq") is not None:
-                return float(pesos_g["liq"])
-    except (TypeError, ValueError):
+        from app.utils.core.result_sink.json_file_sink import JsonFileSink as _JFS  # type: ignore
+        from app.utils.core.result_sink.stdout_sink import StdoutSink as _SS  # type: ignore
+        from app.utils.core.result_sink.multi_sink import MultiSink as _MS  # type: ignore
+        JsonFileSink, StdoutSink, MultiSink = _JFS, _SS, _MS
+    except Exception:
         pass
-    for k in ("peso_kg", "weight_kg", "kg"):
-        v = produto.get(k)
-        if v is not None:
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                pass
-    for k in ("peso_g", "weight_g", "g"):
-        v = produto.get(k)
-        if v is not None:
-            try:
-                return float(v) / 1000.0
-            except (TypeError, ValueError):
-                pass
-    return 0.0
+
+# Fallback minimalista: usa atomic_write_json e um stdout simples
+if JsonFileSink is None:
+    class _FallbackJsonFileSink:
+        def __init__(self, path: str, atomic: bool = True, rotate_keep: int = 0):
+            self.path = path
+            self.atomic = atomic
+            self.rotate_keep = rotate_keep
+        def emit(self, payload: dict, name: str = "") -> None:
+            # atomic_write_json já é nossa primitiva segura
+            atomic_write_json(self.path, payload)
+    class _FallbackStdoutSink:
+        def emit(self, payload: dict, name: str = "") -> None:
+            print(f"[STDOUT:{name}]", json.dumps(payload, ensure_ascii=False)[:2000])
+    class _FallbackMultiSink:
+        def __init__(self, sinks):
+            self.sinks = sinks
+        def emit(self, payload: dict, name: str = "") -> None:
+            for s in self.sinks:
+                s.emit(payload, name=name)
+    JsonFileSink, StdoutSink, MultiSink = _FallbackJsonFileSink, _FallbackStdoutSink, _FallbackMultiSink
+
+SCHEMA_VERSION = "1.0.0"
+SCRIPT_NAME = "precificacao.service"
+SCRIPT_VERSION = "0.4.0"
 
 
-# =========================================================
-# Regras do YAML (seleção de fixos / frete grátis 40538)
-# =========================================================
+# =========================
+# Regras (exposto para metrics.py)
+# =========================
 
-def _resolver_fixo_nao_full_por_preco(regras_nf: Mapping[str, Any], preco: float) -> float:
-    faixas = regras_nf.get("custo_fixo_por_unidade_brl") or []
-    fixo_brl = 0.0
-    aplicado = False
-    for item in faixas:
-        if item.get("otherwise"):
-            if not aplicado:
-                try:
-                    fixo_brl = float(item.get("valor", 0.0))
-                except (TypeError, ValueError):
-                    fixo_brl = 0.0
-            break
-        try:
-            max_preco = float(item.get("max_preco", 0.0))
-        except (TypeError, ValueError):
-            continue
-        if preco <= max_preco:
-            if "valor_pct_do_preco" in item:
-                try:
-                    fixo_brl = preco * float(item["valor_pct_do_preco"])
-                except (TypeError, ValueError):
-                    fixo_brl = 0.0
-            else:
-                try:
-                    fixo_brl = float(item.get("valor", 0.0))
-                except (TypeError, ValueError):
-                    fixo_brl = 0.0
-            aplicado = True
-            break
-    return fixo_brl
+def carregar_regras_ml() -> dict:
+    """
+    Lê o YAML de regras do Mercado Livre e devolve como dict.
+    Mantido aqui pois metrics.py pode importar diretamente esse helper.
+    """
+    import yaml  # PyYAML
+    yaml_path = get_regras_meli_yaml_path()
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
-def _banda_preco_key(preco: float) -> Optional[str]:
-    if 79.0 <= preco <= 99.99:
-        return "79-99.99"
-    if 100.0 <= preco <= 119.99:
-        return "100-119.99"
-    if 120.0 <= preco <= 149.99:
-        return "120-149.99"
-    if 150.0 <= preco <= 199.99:
-        return "150-199.99"
-    if preco > 200.0:
-        return ">200"
-    return None
 
-def _frete_gratis_40538_valor(regras_nf: Mapping[str, Any], preco: float, peso_kg: float) -> float:
-    cfg = regras_nf.get("frete_gratis_40538") or {}
+# =========================
+# Construção do documento
+# =========================
+def _num(x):
+    """Converte para float quando possível; mantém None se vazio/inválido."""
     try:
-        threshold = float(cfg.get("threshold_preco_brl", 79.0))
-    except (TypeError, ValueError):
-        threshold = 79.0
-    if preco < threshold:
-        return 0.0
-    bandas = cfg.get("tabelas_por_preco") or {}
-    key = _banda_preco_key(preco)
-    if not key or key not in bandas:
-        return 0.0
-    faixas = bandas[key] or []
-    for item in faixas:
-        try:
-            max_kg = float(item.get("max_kg", 0.0))
-        except (TypeError, ValueError):
-            continue
-        if peso_kg <= max_kg:
-            try:
-                return float(item.get("valor", 0.0))
-            except (TypeError, ValueError):
-                return 0.0
-    return 0.0
+        return float(x) if x is not None else None
+    except Exception:
+        return None
 
-def _fixo_full_por_preco(regras_full: Mapping[str, Any], preco: float) -> float:
-    faixas = regras_full.get("custo_fixo_por_unidade_brl") or []
-    fixo = 0.0
-    aplicado = False
-    for item in faixas:
-        if item.get("otherwise"):
-            if not aplicado:
-                try:
-                    fixo = float(item.get("valor", 0.0))
-                except (TypeError, ValueError):
-                    fixo = 0.0
-            break
-        try:
-            max_preco = float(item.get("max_preco", 0.0))
-        except (TypeError, ValueError):
-            continue
-        if preco <= max_preco:
-            try:
-                fixo = float(item.get("valor", 0.0))
-            except (TypeError, ValueError):
-                fixo = 0.0
-            aplicado = True
-            break
-    return fixo
-
-
-# =========================================================
-# API pública
-# =========================================================
-
-def precificar_meli(regiao: Regiao | None = None) -> List[Dict[str, Any]]:
+def _coalesce_rebate(src: dict) -> tuple[float | None, float | None]:
     """
-    Retorna 1 linha por anúncio do Mercado Livre:
-      - MCP completo quando existir custo do produto;
-      - MCP “sem custo” (base) quando o produto não estiver no catálogo.
+    Resolve campos de rebate vindos do PP de anúncios (variações de schema).
+    Retorna: (rebate_price_discounted, rebate_price_list)
     """
-    regras = get_regras_ml()
+    # Preço com rebate aplicado (o que vai para "discounted")
+    r_discounted = (
+        src.get("rebate_price_discounted")
+        or src.get("rebate_price_all_methods")  # << campo do seu PP canônico
+        or src.get("deal_price")
+        or src.get("sale_price")
+    )
+    # Preço "de lista"/original (opcional, útil para auditoria e telas)
+    r_list = (
+        src.get("rebate_price_list")
+        or src.get("original_price")
+        or src.get("base_price")
+    )
+    return _num(r_discounted), _num(r_list)
 
-    # ---- Anúncios (tenta múltiplos candidatos; pode mesclar) ----
-    cand_anuncios = anuncios_pp_candidates_meli(regiao=regiao)
-    existentes_anuncios: List[Path] = [Path(p) for p in cand_anuncios if Path(p).exists()]
-    if not existentes_anuncios:
-        pretty = "\n - ".join(str(p) for p in cand_anuncios)
-        raise FileNotFoundError(
-            "Não foi possível localizar o PP de anúncios do Mercado Livre.\n"
-            "Caminhos testados:\n - " + pretty
-        )
-    anuncios_records: List[Dict[str, Any]] = []
-    for p in existentes_anuncios:
-        data = read_json(p)
-        _extract_dicts(data, anuncios_records)
 
-    # Deduplicar anúncios por mlb/id
-    seen: Set[str] = set()
-    anuncios: List[Dict[str, Any]] = []
-    for a in anuncios_records:
-        k = str(a.get("mlb") or a.get("id") or "")
-        if k and k in seen:
-            continue
-        if k:
-            seen.add(k)
-        anuncios.append(a)
+def construir_dataset_base(periodo_or_regiao, regiao: Union[Regiao, str, None] = None) -> Dict[str, Any]:
+    """
+    Backward-compatible:
+      - construir_dataset_base(Periodo(...), regiao)
+      - construir_dataset_base(regiao)  # período inferido do mês/ano atuais (apenas para _meta)
+    """
+    from datetime import datetime
 
-    if not anuncios:
-        pretty = "\n - ".join(str(p) for p in existentes_anuncios)
-        raise RuntimeError(
-            "Nenhum anúncio válido foi encontrado após leitura e parsing.\n"
-            "Verifique o conteúdo dos arquivos:\n - " + pretty
-        )
+    if regiao is None:
+        regiao = periodo_or_regiao
+        now = datetime.utcnow()
+        periodo = Periodo(now.year, now.month)
+    else:
+        periodo = periodo_or_regiao
 
-    # ---- Produtos (tenta múltiplos candidatos; pode mesclar) ----
-    cand_produtos = produtos_pp_candidates()
-    existentes_prod: List[Path] = [Path(p) for p in cand_produtos if Path(p).exists()]
-    if not existentes_prod:
-        pretty_p = "\n - ".join(str(p) for p in cand_produtos)
-        raise FileNotFoundError(
-            "Não foi possível localizar o PP de produtos.\n"
-            "Caminhos testados:\n - " + pretty_p
-        )
-    produtos_records: List[Dict[str, Any]] = []
-    for p in existentes_prod:
-        data_p = read_json(p)
-        _extract_dicts(data_p, produtos_records)
+    r = regiao.value if isinstance(regiao, Regiao) else str(regiao).lower()
 
-    # Índice para match rápido
-    produtos_idx = _build_index_produtos(produtos_records)
+    # 1) integridade do PP
+    validar_integridade_pp(r)
 
-    # ---- Cálculo por anúncio (sempre 1 linha) ----
-    resultados: List[Dict[str, Any]] = []
-    for a in anuncios:
-        preco = _preco_venda(a)
-        full = _is_full(a)
-        produto = _match_produto(produtos_idx, a)
-        custo_produto = _custo_do_produto(produto)
+    # 2) listar anúncios (PP)
+    try:
+        regiao_enum = regiao if isinstance(regiao, Regiao) else Regiao(r)
+    except Exception:
+        regiao_enum = Regiao.SP if r == "sp" else Regiao.MG
+    anuncios = listar_anuncios_pp(regiao_enum)
 
-        # custo fixo (R$) conforme perfil
-        fixo_brl = 0.0
-        if preco is not None:
-            if full:
-                fixo_brl = _fixo_full_por_preco(regras.get("full", {}), preco)
-            else:
-                fixo_brl = _resolver_fixo_nao_full_por_preco(regras.get("nao_full", {}), preco)
-                if produto:
-                    peso_kg = _peso_em_kg(produto)
-                    fg = _frete_gratis_40538_valor(regras.get("nao_full", {}), preco, peso_kg)
-                    if fg > 0:
-                        fixo_brl = fg
+    def _coletar_list(a):
+        if a is None:
+            return []
+        if isinstance(a, list):
+            return a
+        if isinstance(a, dict):
+            for k in ("data", "items", "results", "anuncios"):
+                if k in a and isinstance(a[k], list):
+                    return a[k]
+            return []
+        if isinstance(a, str):
+            try:
+                import json
+                with open(a, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                return _coletar_list(obj)
+            except Exception:
+                return []
+        return []
 
-        # percentuais
+    anuncios_list = _coletar_list(anuncios)
+    if not anuncios_list:
+        import json as _json
         try:
-            comissao_pct = float(regras["comissao"]["classico_pct"])
-        except (TypeError, ValueError, KeyError):
-            comissao_pct = 0.14
-        imposto_pct = float(regras["default"]["imposto_pct"])
-        marketing_pct = float(regras["default"]["marketing_pct"])
+            with open(get_anuncios_pp_path(regiao), "r", encoding="utf-8") as f:
+                obj = _json.load(f)
+            anuncios_list = _coletar_list(obj)
+        except Exception:
+            anuncios_list = []
 
-        # Monta linha de saída
-        base = {
-            "canal": "meli",
-            "regiao": getattr(regiao, "value", None),
-            "mlb": a.get("mlb") or a.get("id"),
-            "sku": a.get("sku"),
-            "gtin": a.get("gtin"),
+    # 3) montar itens normalizados (com rebate coalescido)
+    itens: List[Dict[str, Any]] = []
+    for a in anuncios_list:
+        rebate_disc, rebate_list = _coalesce_rebate(a)
+
+        item = {
+            "mlb": a.get("id") or a.get("mlb"),
+            "sku": a.get("seller_sku") or a.get("sku"),
+            "gtin": a.get("gtin") or a.get("ean"),
             "title": a.get("title"),
-            "full": full,
-            "preco_venda": preco,
-            "custo_fixo_brl": fixo_brl,
+            "price": _num(a.get("price")),
+            "original_price": _num(a.get("original_price")),  # opcional (auditoria)
+            "rebate_price_discounted": rebate_disc,           # << agora preenche a partir de rebate_price_all_methods
+            "rebate_price_list": rebate_list,
+            "logistic_type": a.get("logistic_type"),
+            "is_full": bool((a.get("logistic_type") or "").lower() in {"fulfillment", "fulfillment_co"}),
+            "regiao": r,
         }
 
-        # 1) Sem preço → não dá para calcular nada
-        if preco is None:
-            resultados.append({**base, "status": "faltando_preco", "mcp_pct": None, "mcp_sem_custo_pct": None})
-            continue
+        # Fora do Full: não sugerimos faixa/custo fixo
+        if not is_item_full(item):
+            item["custo_fixo_full"] = None
+            item["preco_min"] = None
+            item["preco_max"] = None
 
-        # 2) Calcular “MCP base” (sem custo de produto) — sempre possível com preço
-        comp_base = calcular_componentes(
-            preco_venda=preco,
-            custo=0.0 + fixo_brl,
-            imposto_pct=imposto_pct,
-            frete_pct=0.0,
-            marketing_pct=marketing_pct,
-            take_rate_pct=comissao_pct,
-        )
-        mcp_sem_custo = comp_base["mcp_pct"]
+        itens.append(item)
 
-        # 3) Se existir custo de produto → MCP completo
-        if custo_produto is not None:
-            comp_full = calcular_componentes(
-                preco_venda=preco,
-                custo=custo_produto + fixo_brl,
-                imposto_pct=imposto_pct,
-                frete_pct=0.0,
-                marketing_pct=marketing_pct,
-                take_rate_pct=comissao_pct,
-            )
-            resultados.append({
-                **base,
-                "custo": comp_full["custo"],
-                "imposto_valor": comp_full["imposto_valor"],
-                "marketing_valor": comp_full["marketing_valor"],
-                "tarifa_canal_valor": comp_full["tarifa_canal_valor"],
-                "mc_valor": comp_full["mc_valor"],
-                "mcp_pct": comp_full["mcp_pct"],
-                "mcp_sem_custo_pct": mcp_sem_custo,
-                "status": "ok",
-            })
-        else:
-            # Sem custo → entrega MCP base e status explícito
-            resultados.append({
-                **base,
-                "custo": None,
-                "imposto_valor": comp_base["imposto_valor"],
-                "marketing_valor": comp_base["marketing_valor"],
-                "tarifa_canal_valor": comp_base["tarifa_canal_valor"],
-                "mc_valor": comp_base["mc_valor"],
-                "mcp_pct": None,
-                "mcp_sem_custo_pct": mcp_sem_custo,
-                "status": "produto_nao_encontrado",
-            })
+    itens.sort(key=lambda x: (str(x.get("mlb") or ""), str(x.get("sku") or "")))
 
-    return resultados
+    return {
+        "periodo": {"ano": periodo.ano, "mes": periodo.mes},
+        "regiao": r,
+        "marketplace": Marketplace.MELI.value,
+        "camada": Camada.PP.value,
+        "stage": Stage.DEV.value,  # ajuste conforme seu ambiente ativo
+        "itens": itens,
+    }
 
-def listar_anuncios_meli(regiao: Regiao | None = None) -> List[Dict[str, Any]]:
+def enriquecer_preco_compra(documento: Dict[str, Any]) -> Dict[str, Any]:
+    indices = get_indices_produtos()
+    if not isinstance(indices, dict) or (not indices.get('por_gtin') and not indices.get('por_sku')):
+        indices = _build_produtos_indices_fallback()
+
+    it_out: List[Dict[str, Any]] = []
+    for it in documento["itens"]:
+        gtin = (it.get("gtin") or "").strip() if it.get("gtin") else None
+        sku = (it.get("sku") or "").strip() if it.get("sku") else None
+
+        preco_compra = None
+        if gtin and gtin in indices.get("por_gtin", {}):
+            preco_compra = indices["por_gtin"][gtin].get("preco_compra")
+        elif sku and sku in indices.get("por_sku", {}):
+            preco_compra = indices["por_sku"][sku].get("preco_compra")
+
+        it2 = dict(it)
+        it2["preco_compra"] = preco_compra
+        it_out.append(it2)
+
+    documento2 = dict(documento)
+    documento2["itens"] = it_out
+    return documento2
+
+
+def aplicar_metricas_no_documento(documento: Dict[str, Any], *, use_rebate_as_price: bool = True) -> Dict[str, Any]:
+    itens_out = []
+    for it in documento["itens"]:
+        calc = calcular_metricas_item(it, use_rebate_as_price=use_rebate_as_price)
+        merged = dict(it)
+        merged.update(calc)
+        itens_out.append(merged)
+
+    doc2 = dict(documento)
+    doc2["itens"] = itens_out
+    doc2["metrics"] = agregar_metricas_documento(itens_out)
+    return doc2
+
+def _build_produtos_indices_fallback() -> dict:
     """
-    Retorna somente os campos básicos do anúncio (sem MCP):
-      canal, regiao, mlb, sku, gtin, title, full, preco_venda
+    Lê o produtos.json diretamente e monta índices por_gtin / por_sku.
+    Aceita tanto {"items": {...}} (dict por GTIN) quanto {"items": [...]}.
     """
-    # ---- Anúncios (tenta múltiplos candidatos; pode mesclar) ----
-    cand_anuncios = anuncios_pp_candidates_meli(regiao=regiao)
-    existentes_anuncios: List[Path] = [Path(p) for p in cand_anuncios if Path(p).exists()]
-    if not existentes_anuncios:
-        pretty = "\n - ".join(str(p) for p in cand_anuncios)
-        raise FileNotFoundError(
-            "Não foi possível localizar o PP de anúncios do Mercado Livre.\n"
-            "Caminhos testados:\n - " + pretty
-        )
-    anuncios_records: List[Dict[str, Any]] = []
-    for p in existentes_anuncios:
-        data = read_json(p)
-        _extract_dicts(data, anuncios_records)
+    path = get_produtos_pp_path()
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
 
-    # Deduplicar por mlb/id
-    seen: Set[str] = set()
-    anuncios: List[Dict[str, Any]] = []
-    for a in anuncios_records:
-        k = str(a.get("mlb") or a.get("id") or "")
-        if k and k in seen:
-            continue
-        if k:
-            seen.add(k)
-        anuncios.append(a)
+    por_gtin, por_sku = {}, {}
 
-    saida: List[Dict[str, Any]] = []
-    reg = getattr(regiao, "value", None)
-    for a in anuncios:
-        preco = _preco_venda(a)
-        sku = a.get("sku")
-        saida.append({
-            "canal": "meli",
-            "regiao": reg,
-            "mlb": a.get("mlb") or a.get("id"),
-            "sku": sku,
-            "sku_normalizado": _sku_normalizado(sku) if sku else None,
-            "gtin": a.get("gtin"),
-            "title": a.get("title"),
-            "full": _is_full(a),
-            "preco_venda": preco if isinstance(preco, float) else None,
-            # levar valores brutos para que as métricas apliquem o subsídio de tarifa
-            "price": a.get("price"),
-            "rebate_price": a.get("rebate_price"),
-            "subsidio_tarifa_brl": _subsidio_tarifa(a),
-        })
-    return saida
+    items = obj.get("items")
+    if isinstance(items, dict):
+        iterable = items.values()
+    elif isinstance(items, list):
+        iterable = items
+    else:
+        iterable = []
+
+    for p in iterable:
+        gtin = (p.get("gtin") or p.get("sku") or "").strip()
+        sku = (p.get("sku") or "").strip()
+        if gtin:
+            por_gtin[gtin] = p
+        if sku:
+            por_sku[sku] = p
+
+    return {"por_gtin": por_gtin, "por_sku": por_sku}
+
+# =========================
+# DQ checks
+# =========================
+
+def _fail(msg: str, *, samples: List[Dict[str, Any]] | None = None) -> None:
+    if samples:
+        StdoutSink().emit({"message": msg, "samples": samples}, name="DQ_FAIL_SAMPLES")
+    raise ValueError(msg)
+
+
+def _dq_checks(documento: Dict[str, Any], *, allow_empty: bool = False, source_path: str | None = None) -> None:
+    import math as _math
+
+    itens = documento.get("itens") or []
+    if len(itens) == 0:
+        if allow_empty:
+            StdoutSink().emit({"warning": "DQ: row_count=0 (liberado por allow_empty)", "source": source_path or ""}, name="DQ_WARN")
+            return
+        _fail(f"DQ: row_count=0. Verifique a fonte: {source_path or ''}")
+
+    # unicidade de mlb (quando presente)
+    mlbs = [x.get("mlb") for x in itens if x.get("mlb")]
+    if len(mlbs) != len(set(mlbs)):
+        _fail("DQ: chaves MLB duplicadas detectadas.", samples=[{"mlb": m} for m in mlbs])
+
+    # coerência de FULL
+    for it in itens:
+        if it.get("is_full") and not (it.get("gtin") or it.get("sku")):
+            _fail("DQ: item FULL sem gtin/sku.", samples=[it])
+
+    # tipos numéricos esperados
+    def _is_num(v) -> bool:
+        try:
+            return (v is not None) and (not isinstance(v, bool)) and _math.isfinite(float(v))
+        except Exception:
+            return False
+
+    for it in itens:
+        price_fields = ["price", "rebate_price_list", "rebate_price_discounted"]
+        if not any(_is_num(it.get(f)) for f in price_fields):
+            _fail("DQ: item sem nenhum preço válido (price ou rebate_*).", samples=[it])
+
+        if it.get("preco_compra") is not None and not _is_num(it.get("preco_compra")):
+            _fail("DQ: preco_compra inválido.", samples=[it])
+
+
+# =========================
+# Persistência via Result Sink
+# =========================
+
+def _hash_payload_ordered(items: List[Dict[str, Any]]) -> str:
+    payload = json.dumps(items, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    import hashlib as _hashlib
+    return "sha256:" + _hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_meta(documento: Dict[str, Any], *, source_paths: List[str]) -> Dict[str, Any]:
+    row_count = len(documento.get("itens") or [])
+    h = _hash_payload_ordered(documento["itens"])
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "stage": Camada.PP.value,
+        "marketplace": Marketplace.MELI.value,
+        "regiao": documento.get("regiao"),
+        "camada": Camada.PP.value,
+        "schema_version": SCHEMA_VERSION,
+        "script_name": SCRIPT_NAME,
+        "script_version": SCRIPT_VERSION,
+        "source_paths": source_paths,
+        "row_count": row_count,
+        "hash": h,
+    }
+
+
+def salvar_documentos(
+    documento: Dict[str, Any],
+    regiao: Union[Regiao, str],
+    *, keep: int = 7, debug: bool = False
+) -> Tuple[str, str]:
+    """
+    Grava artefatos (principal + metrics) via ResultSink, com rotação keep=N.
+    Retorna (path_json, path_metrics).
+    """
+    anuncios_path = str(get_anuncios_pp_path(regiao))
+    import os as _os
+    allow_empty = debug or (_os.getenv('DATAHIVE_ALLOW_EMPTY', '0') == '1')
+    _dq_checks(documento, allow_empty=allow_empty, source_path=anuncios_path)
+
+
+    source_paths = [
+        str(get_anuncios_pp_path(regiao)),
+        str(get_produtos_pp_path()),
+    ]
+
+    documento2 = dict(documento)
+    documento2["_meta"] = _build_meta(documento, source_paths=source_paths)
+
+    out_json = str(get_precificacao_dataset_path(regiao))
+    out_metrics = str(get_precificacao_metrics_path(regiao))
+
+    sinks = [JsonFileSink(out_json, atomic=True, rotate_keep=keep)]
+    if debug:
+        sinks.append(StdoutSink())
+    sink = MultiSink(sinks)
+
+    sink.emit(documento2, name="precificacao_dataset")
+
+    metrics_only = {
+        "periodo": documento.get("periodo"),
+        "regiao": documento.get("regiao"),
+        "marketplace": documento.get("marketplace"),
+        "camada": documento.get("camada"),
+        "_meta": {k: documento2["_meta"][k] for k in documento2["_meta"] if k not in {"row_count", "hash"}},
+        "metrics": documento.get("metrics"),
+    }
+    JsonFileSink(out_metrics, atomic=True, rotate_keep=keep).emit(metrics_only, name="precificacao_metrics")
+
+    return out_json, out_metrics
+
+
+# ===== Backward compatibility (scripts antigos) =====
+
+def salvar_dataset(documento: Dict[str, Any], regiao: Union[Regiao, str], *, keep: int = 7, debug: bool = False) -> str:
+    """
+    Compat: scripts antigos chamam salvar_dataset().
+    Aqui gravamos apenas o dataset principal (sem o artefato de métricas).
+    """
+    anuncios_path = str(get_anuncios_pp_path(regiao))
+    import os as _os
+    allow_empty = debug or (_os.getenv('DATAHIVE_ALLOW_EMPTY', '0') == '1')
+    _dq_checks(documento, allow_empty=allow_empty, source_path=anuncios_path)
+
+
+    source_paths = [
+        str(get_anuncios_pp_path(regiao)),
+        str(get_produtos_pp_path()),
+    ]
+    documento2 = dict(documento)
+    documento2["_meta"] = _build_meta(documento, source_paths=source_paths)
+
+    out_json = str(get_precificacao_dataset_path(regiao))
+
+    sinks = [JsonFileSink(out_json, atomic=True, rotate_keep=keep)]
+    if debug:
+        sinks.append(StdoutSink())
+    MultiSink(sinks).emit(documento2, name="precificacao_dataset")
+
+    return out_json
+
+
+# =========================
+# Orquestração do módulo
+# =========================
+
+def executar(periodo: Periodo, regiao: Union[Regiao, str], *, use_rebate_as_price: bool = True, keep: int = 7, debug: bool = False) -> Tuple[str, str]:
+    """
+    1) carrega anúncios (PP) → documento base
+    2) enriquece com preço de compra (produtos PP)
+    3) calcula métricas item-a-item e agregadas
+    4) executa validações e grava artefatos por região
+    """
+    base = construir_dataset_base(periodo, regiao)
+    com_custo = enriquecer_preco_compra(base)
+    com_metricas = aplicar_metricas_no_documento(com_custo, use_rebate_as_price=use_rebate_as_price)
+
+    # >>> NOVO: validação de insumos para MCP (gera avisos por item e em _meta.warnings)
+    validado = anexar_warnings_mcp(com_metricas)
+
+    return salvar_documentos(validado, regiao, keep=keep, debug=debug)
+
+def simular_mcp(mlb: str, regiao: Union[Regiao, str], preco_venda: float, subsidio_valor: float = 0.0) -> Dict[str, Any]:
+    """Carrega o item do dataset da região e retorna simulação de MCP para (preço, subsídio)."""
+    ds_path = get_precificacao_dataset_path(regiao)
+    with open(ds_path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+    itens = doc.get("itens") or []
+    alvo = next((it for it in itens if str(it.get("mlb")) == str(mlb)), None)
+    if not alvo:
+        return {"error": f"MLB {mlb} não encontrado no dataset de {regiao}."}
+    return simular_mcp_item(alvo, preco_venda=float(preco_venda), subsidio_valor=float(subsidio_valor))

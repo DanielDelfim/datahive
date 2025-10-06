@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from app.config.paths import Camada
 from app.utils.produtos.config import produtos_json, cadastro_produtos_excel
+from app.utils.produtos.mappers.dimensions import normalize_peso_dimensoes
 
 # Import resiliente do módulo de mapeamento:
 # 1) nome atual "mappers"
@@ -23,8 +24,12 @@ except ImportError:
         except ImportError:
             from . import mapeadores  # relativo (legado)
 
-from app.utils.produtos.aggregator import carregar_excel_normalizado
+from app.utils.produtos.aggregator import carregar_excel_normalizado, carregar_excel_normalizado_detalhado
 
+def normalizar_excel_detalhado() -> tuple[dict, list[dict]]:
+    """Fachada pública p/ geração do PP a partir do Excel (sem escrita)."""
+    from app.utils.produtos.config import cadastro_produtos_excel
+    return carregar_excel_normalizado_detalhado(cadastro_produtos_excel())
 
 def carregar_pp(camada: Camada = Camada.PP) -> Dict[str, Any]:
     """
@@ -67,7 +72,6 @@ def get_indices(camada: Camada = Camada.PP) -> Dict[str, Dict[str, Any]]:
         "sku_to_dun14": mapeadores.sku_to_dun14(items),
     }
 
-
 def preview_normalizacao_excel() -> Dict[str, Dict[str, Any]]:
     """
     Carrega o Excel do módulo a partir do caminho padrão e devolve
@@ -76,3 +80,28 @@ def preview_normalizacao_excel() -> Dict[str, Dict[str, Any]]:
     """
     excel = cadastro_produtos_excel()
     return carregar_excel_normalizado(excel)
+
+def listar_produtos() -> dict[str, dict]: return get_itens()
+def obter_custos_por_gtin(gtin: str) -> float | None:
+    for rec in get_itens().values():
+        if rec.get("gtin") == gtin:
+            return rec.get("preco_compra")
+    return None
+
+def listar_produtos_normalizado() -> Dict[str, Dict[str, Any]]:
+    """
+    Fachada pública: retorna dict[sku]->registro com
+    peso/altura/largura/profundidade já preenchidos (kg/cm) quando possíveis.
+    Não grava; apenas enriquece os registros carregados do PP.
+    """
+    base = listar_produtos()  # já existente no seu service
+    out: Dict[str, Dict[str, Any]] = {}
+    for sku, rec in base.items():
+        rec2 = dict(rec)  # cópia superficial
+        dims = normalize_peso_dimensoes(rec2)
+        # só preenche se estiver faltando ou None:
+        for k, v in dims.items():
+            if rec2.get(k) in (None, "", [], {}):
+                rec2[k] = v
+        out[sku] = rec2
+    return out

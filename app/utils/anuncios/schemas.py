@@ -4,10 +4,13 @@ from typing import TypedDict, Optional, List, Dict, Any
 class PPAnuncio(TypedDict, total=False):
     mlb: str
     sku: Optional[str]
+    gtin: Optional[str]
     title: Optional[str]
     estoque: Optional[float]
     price: Optional[float]
     original_price: Optional[float]
+    rebate_price: float | int | None
+    rebate_currency: str | None
     status: Optional[str]
     logistic_type: Optional[str]
 

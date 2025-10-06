@@ -96,6 +96,13 @@ def _normalizar_raw_para_pp(raw_env: Dict[str, Any]) -> List[Dict[str, Any]]:
         # Novo: preço com desconto para todos os meios (sale_terms)
         rebate_num, rebate_unit = _sale_terms_number(it, "ALL_METHODS_REBATE_PRICE")
 
+        # helper simples para coerção segura
+        def _f(x):
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                return None
+
         rec = {
             "mlb": it.get("id"),
             "title": it.get("title"),
@@ -103,11 +110,13 @@ def _normalizar_raw_para_pp(raw_env: Dict[str, Any]) -> List[Dict[str, Any]]:
             "gtin": _extract_gtin(it),
             "price": it.get("price"),
             "original_price": it.get("original_price"),
+            "rebate_price": rebate_num,           # <= usar o valor extraído
+            "rebate_currency": rebate_unit,       # <= usar o valor extraído
             "status": it.get("status"),
             "logistic_type": logistic_type,
+            "estoque": _f(it.get("available_quantity")),
             # novos campos
             "rebate_price_all_methods": rebate_num,   # ex.: 34.44
-            "rebate_currency": rebate_unit,          # ex.: "BRL"
         }
         out.append(rec)
     return out

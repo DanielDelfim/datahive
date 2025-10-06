@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List, Dict, Any, Optional
 
 from .aggregator import _carregar_pp
+import app.utils.anuncios.aggregator as ag
 from .schemas import PPAnuncio, has_minimal_fields
 from . import filters  # by_* / apply_filters
 from app.utils.core.identifiers import normalize_gtin
@@ -16,19 +17,20 @@ from pathlib import Path
 def _coerce_items(env: Any) -> List[Dict[str, Any]]:
     """
     Aceita formatos comuns:
-    - dict com 'data' (preferido)
-    - dict com 'items'
+    - dict com 'data' | 'items' | 'itens' | 'results' (lista ou dict-mapa)
     - lista já "flat"
     """
     if isinstance(env, dict):
-        if isinstance(env.get("data"), list):
-            return env["data"]
-        if isinstance(env.get("items"), list):
-            return env["items"]
-        # alguns dumps antigos podem ter outra chave; aqui poderíamos adicionar mais fallbacks
+        for key in ("data", "items", "itens", "results"):
+            val = env.get(key)
+            if isinstance(val, list):
+                return val
+            if isinstance(val, dict):
+                # aceita mapeamentos id->obj
+                return [v for v in val.values() if isinstance(v, dict)]
         return []
     if isinstance(env, list):
-        return env
+        return [it for it in env if isinstance(it, dict)]
     return []
 
 def _pp_path_for(regiao: Regiao) -> Optional["Path"]:
@@ -185,3 +187,42 @@ def obter_anuncio_por_mlb(regiao: str, mlb: str) -> Optional[dict]:
     if anuncio:
         _normalize_gtins_inplace(anuncio)
     return anuncio
+
+def _resolve_regioes(regiao: Regiao | str | None) -> list[Regiao]:
+    # Se não vier nada (ou vier "none"), tenta em TODAS as regiões do enum
+    if regiao is None or str(regiao).strip().lower() in {"none", ""}:
+        return list(Regiao)
+
+    # Já é enum?
+    if isinstance(regiao, Regiao):
+        return [regiao]
+
+    # Tenta casar por value ("sp","mg",...) ou por name ("SP","MG",...)
+    s = str(regiao).strip().lower()
+    for r in Regiao:
+        if r.value == s or r.name.lower() == s:
+            return [r]
+
+    # Último recurso: tentar construir pelo value/name; se falhar, considera todas
+    try:
+        return [Regiao(s)]
+    except Exception:
+        return list(Regiao)
+
+def obter_raw_por_mlb(mlb: str, regiao: Regiao | str | None) -> Optional[Dict[str, Any]]:
+    """
+    Retorna o registro RAW (cru) do anúncio para o MLB. Se regiao vier None/“none”,
+    procura em todas as regiões do Enum Regiao.
+    """
+    if not mlb:
+        return None
+
+    for r in _resolve_regioes(regiao):
+        items = ag.carregar_raw(r)  # lista de dicts (pode ser vazia)
+        for it in items:
+            try:
+                if str(it.get("id")) == str(mlb):
+                    return it
+            except Exception:
+                continue
+    return None
