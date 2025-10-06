@@ -76,6 +76,7 @@ class Marketplace(str, Enum):
 class Regiao(str, Enum):
     MG = "mg"
     SP = "sp"
+    ES = "es"
 
 class Camada(str, Enum):
     RAW = "raw"

@@ -3,12 +3,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Protocol, Optional, Literal, Any
+from pathlib import Path
+from typing import Iterable
+
+# Imports locais (sinks concretos)
+from .json_file_sink import JsonFileSink
+from .stdout_sink import StdoutSink
+from .null_sink import NullSink
+from .multi_sink import MultiSink
+
 
 # Tipos suportados (extensível futuramente: "null", "multi")
 SinkKind = Literal["json", "stdout"]
 
 
-class ResultSink(Protocol):
+class ResultSinkProtocol(Protocol):
     """Contrato para destino de resultados.
 
     Deve ser utilizado por SCRIPTS que produzem artefatos (JSONs) ou logs
@@ -24,7 +33,6 @@ class ResultSink(Protocol):
         """
         ...
 
-
 @dataclass
 class SinkConfig:
     kind: SinkKind
@@ -32,7 +40,7 @@ class SinkConfig:
     options: dict[str, Any] | None = None
 
 
-def make_sink(kind: SinkKind, **kwargs: Any) -> ResultSink:
+def make_sink(kind: SinkKind, **kwargs: Any) -> ResultSinkProtocol:
     """Fábrica de sinks.
 
     Examples:
@@ -57,7 +65,7 @@ def resolve_sink_from_flags(
     to_file: bool,
     to_stdout: bool = True,
     **kwargs: Any,
-) -> ResultSink:
+) -> ResultSinkProtocol:
     """Ajuda scripts a decidir o destino dos resultados.
 
     Recomendado para scripts via flags CLI:
@@ -77,3 +85,41 @@ def resolve_sink_from_flags(
         return make_sink("stdout")
     # Se nada for escolhido, ainda assim imprimimos (seguro)
     return make_sink("stdout")
+
+
+class ResultSink:
+    """Contrato simples para sinks de saída."""
+    def write(self, payload: Any, *, dry_run: bool = False, debug: bool = False):
+        raise NotImplementedError
+
+def build_sink(
+    kind: str,
+    *,
+    target_path: Optional[Path] = None,
+    do_backup: bool = True,
+    pretty: bool = True,
+    children: Optional[Iterable[ResultSink]] = None,
+) -> ResultSink:
+    """
+    Factory de sinks.
+    kind:
+      - "json_file"  → grava JSON atômico
+      - "stdout"     → imprime no stdout
+      - "null"       → descarta
+      - "multi"      → despacha para vários sinks (usar 'children')
+    """
+    k = (kind or "").lower()
+    if k == "json_file":
+        if target_path is None:
+            raise ValueError("json_file sink requer target_path")
+        return JsonFileSink(target_path=target_path, do_backup=do_backup, pretty=pretty)
+    if k == "stdout":
+        return StdoutSink(pretty=pretty)
+    if k == "null":
+        return NullSink()
+    if k == "multi":
+        if not children:
+            raise ValueError("multi sink requer 'children'")
+        return MultiSink(children=list(children))
+    raise ValueError(f"Sink desconhecido: {kind}")
+

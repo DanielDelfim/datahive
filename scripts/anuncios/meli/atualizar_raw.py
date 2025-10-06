@@ -55,15 +55,46 @@ def _build_client(loja: str) -> tuple[MeliClient, str]:
 def _fetch_all_items(cli: MeliClient, seller_id: str) -> List[str]:
     logging.info("Listando MLBs do seller %s ...", seller_id)
     ids = cli.search_seller_items(seller_id=seller_id, limit=100)
-    logging.info("Total de MLBs obtidos: %d", len(ids))
-    return ids
+
+    def _dedupe_preserve_order(seq):
+        seen, out = set(), []
+        for x in seq:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    orig = ids
+    ids = _dedupe_preserve_order(ids)
+    if len(ids) != len(orig):
+        logging.info(
+            "Removidos %d IDs duplicados antes do bulk (de %d para %d).",
+            len(orig) - len(ids), len(orig), len(ids)
+        )
+    return ids  # <<< FALTAVA ESTE RETURN
+
 
 
 def _fetch_items_details(cli: MeliClient, ids: List[str]) -> List[Dict[str, Any]]:
     logging.info("Baixando detalhes em lote ...")
     items = cli.get_items_bulk(ids)
-    logging.info("Itens detalhados baixados: %d", len(items))
-    return items
+
+    # dedup por 'id' preservando ordem
+    seen, items_dedup = set(), []
+    for it in items:
+        k = str(it.get("id") or "")
+        if k and k not in seen:
+            seen.add(k)
+            items_dedup.append(it)
+
+    if len(items_dedup) != len(items):
+        logging.info(
+            "Removidos %d itens duplicados após o bulk (de %d para %d).",
+            len(items) - len(items_dedup), len(items), len(items_dedup)
+        )
+    return items_dedup  # <<< FALTAVA ESTE RETURN
+
+
 
 
 def _persist_raw(regiao: Regiao, payload: Dict[str, Any]) -> Path:
@@ -85,20 +116,39 @@ def _persist_raw(regiao: Regiao, payload: Dict[str, Any]) -> Path:
 def run_for_regiao(regiao: Regiao) -> Path:
     loja = regiao.value  # "sp" / "mg"
     cli, seller_id = _build_client(loja)
-    ids = _fetch_all_items(cli, seller_id)
-    items = _fetch_items_details(cli, ids)
+
+    ids = _fetch_all_items(cli, seller_id)          # agora retorna dedup
+    items = _fetch_items_details(cli, ids)          # agora retorna dedup
+
+    # blindagem extra antes de gravar
+    seen, unique_items = set(), []
+    for it in items:
+        k = str(it.get("id") or "")
+        if k and k not in seen:
+            seen.add(k)
+            unique_items.append(it)
+    items = unique_items
+
+    # sanity (opcional): logar se vier algo repetido
+    from collections import Counter
+    ids_list = [str(i.get("id") or "") for i in items]
+    dups = [k for k, c in Counter(ids_list).items() if c > 1 and k]
+    if dups:
+        logging.warning("Ainda há IDs duplicados no payload: %s", dups)
+
     payload = {
         "metadata": {
             "generated_at": datetime.now().isoformat(),
             "marketplace": Marketplace.MELI.value,
             "regiao": regiao.value,
             "seller_id": seller_id,
-            "count": len(items),
+            "count": len(items),  # contar APÓS a dedup
             "source": "users/{seller}/items/search + items?ids",
         },
         "items": items,
     }
     return _persist_raw(regiao, payload)
+
 
 
 def main() -> None:

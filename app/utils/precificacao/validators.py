@@ -1,143 +1,128 @@
+# -*- coding: utf-8 -*-
+"""
+Validações do módulo de precificação.
+
+- Garante que cada item (MLB) tem insumos suficientes para cálculo de MCP.
+- Verifica presença/consistência de preços mínimo/máximo quando aplicável.
+- Pode ser usado pelo script de agregação para anotar avisos no próprio dataset.
+
+API principal:
+- validar_item_mcp(item) -> list[str]
+- validar_item_ranges(item) -> list[str]
+- validar_documento(doc) -> list[{"mlb": ..., "warnings": [...]}]
+- anotar_warnings_no_documento(doc) -> dict
+"""
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable
+from typing import List, Dict, Any, Optional
+import math
+
+from app.utils.precificacao.filters import is_item_full
+from app.utils.precificacao.metrics import preco_efetivo
 
 
-class RegraInvalida(ValueError):
-    """Erro de validação de regras de precificação."""
+def _is_none(x: Any) -> bool:
+    return x is None or (isinstance(x, float) and math.isnan(x))
 
 
-def _is_number(x: Any) -> bool:
-    return isinstance(x, (int, float))
+def _get_preco_venda_efetivo(item: Dict[str, Any]) -> Optional[float]:
+    # usa campo já calculado ou deriva de (price, rebate_price_discounted)
+    pv = item.get("preco_efetivo")
+    if _is_none(pv) or (isinstance(pv, (int, float)) and float(pv) <= 0):
+        pv = preco_efetivo(item.get("price"), item.get("rebate_price_discounted"), considerar_rebate=True)
+    try:
+        return float(pv) if pv is not None else None
+    except Exception:
+        return None
 
 
-def _req_keys(obj: Dict[str, Any], keys: Iterable[str], raiz: str) -> None:
-    missing = [k for k in keys if k not in obj]
-    if missing:
-        raise RegraInvalida(f"[{raiz}] faltando chaves obrigatórias: {', '.join(missing)}")
+def validar_item_mcp(item: Dict[str, Any]) -> List[str]:
+    """Valida insumos mínimos para cálculo de MCP. Retorna lista de avisos (strings)."""
+    warns: List[str] = []
+
+    # preço de venda efetivo (com rebate)
+    if _get_preco_venda_efetivo(item) is None:
+        warns.append("preco_venda_efetivo_ausente")
+
+    # preço de compra (custo do produto)
+    if _is_none(item.get("preco_compra")):
+        warns.append("preco_compra_ausente")
+
+    # impostos/marketing/comissão — aceitamos pct OU valor absoluto (R$)
+    if _is_none(item.get("imposto")) and _is_none(item.get("imposto_pct")):
+        warns.append("imposto_ausente")
+    if _is_none(item.get("marketing")) and _is_none(item.get("marketing_pct")):
+        warns.append("marketing_ausente")
+    if _is_none(item.get("comissao")) and _is_none(item.get("comissao_pct")):
+        warns.append("comissao_ausente")
+
+    # frete/custo fixo — relevantes para FULL
+    if is_item_full(item):
+        if _is_none(item.get("custo_fixo_full")):
+            warns.append("custo_fixo_full_ausente")
+        if _is_none(item.get("frete_sobre_custo")) and _is_none(item.get("frete_full")):
+            warns.append("frete_ausente")
+
+    return warns
 
 
-def _pct_in_range(v: Any, raiz: str, campo: str) -> None:
-    if not _is_number(v):
-        raise RegraInvalida(f"[{raiz}] '{campo}' deve ser numérico em fração (ex.: 0.14)")
-    v = float(v)
-    if v < 0.0 or v > 1.0:
-        raise RegraInvalida(
-            f"[{raiz}] '{campo}' fora de [0,1]. Use fração (ex.: 0.14 para 14%). Valor recebido: {v}"
-        )
+def validar_item_ranges(item: Dict[str, Any]) -> List[str]:
+    """Valida presença/consistência de preço mínimo/máximo quando aplicável (FULL)."""
+    warns: List[str] = []
+    if not is_item_full(item):
+        return warns  # não exigimos faixa fora do FULL
+
+    pmin = item.get("preco_min")
+    if _is_none(pmin):
+        pmin = item.get("preco_minimo")
+    pmax = item.get("preco_max")
+    if _is_none(pmax):
+        pmax = item.get("preco_maximo")
+
+    if _is_none(pmin):
+        warns.append("preco_min_ausente")
+    if _is_none(pmax):
+        warns.append("preco_max_ausente")
+
+    try:
+        if (pmin is not None) and (pmax is not None) and float(pmin) > float(pmax):
+            warns.append("faixa_preco_inconsistente")
+    except Exception:
+        warns.append("faixa_preco_invalida")
+
+    return warns
 
 
-def _nonneg_number(v: Any, raiz: str, campo: str) -> None:
-    if not _is_number(v):
-        raise RegraInvalida(f"[{raiz}] '{campo}' deve ser numérico (>= 0)")
-    if float(v) < 0.0:
-        raise RegraInvalida(f"[{raiz}] '{campo}' não pode ser negativo. Valor recebido: {v}")
+def validar_documento(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Lista avisos por MLB para um documento completo (dataset_precificacao.json)."""
+    out: List[Dict[str, Any]] = []
+    for it in (doc.get("itens") or []):
+        w = sorted(set(validar_item_mcp(it) + validar_item_ranges(it)))
+        if w:
+            out.append({"mlb": it.get("mlb"), "warnings": w})
+    return out
 
 
-def _validate_faixas_valor(items: Any, raiz: str, chave_lista: str, allow_percent: bool = False) -> None:
-    if not isinstance(items, list):
-        raise RegraInvalida(f"[{raiz}] '{chave_lista}' deve ser lista")
-
-    seen_otherwise = False
-    for i, item in enumerate(items):
-        if not isinstance(item, dict):
-            raise RegraInvalida(f"[{raiz}] item #{i} de '{chave_lista}' deve ser objeto")
-
-        if item.get("otherwise"):
-            # Faixa de fallback
-            if seen_otherwise:
-                raise RegraInvalida(f"[{raiz}] múltiplos 'otherwise' em '{chave_lista}'")
-            seen_otherwise = True
-            if "valor" not in item:
-                raise RegraInvalida(f"[{raiz}] item 'otherwise' em '{chave_lista}' requer 'valor'")
-            _nonneg_number(item["valor"], raiz, f"{chave_lista}[{i}].valor")
-            continue
-
-        if "max_preco" in item:
-            _nonneg_number(item["max_preco"], raiz, f"{chave_lista}[{i}].max_preco")
-        elif "max_kg" in item:
-            _nonneg_number(item["max_kg"], raiz, f"{chave_lista}[{i}].max_kg")
+def anotar_warnings_no_documento(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Clona o documento e injeta 'warnings': [...] em cada item quando aplicável."""
+    it_out: List[Dict[str, Any]] = []
+    for it in (doc.get("itens") or []):
+        w = sorted(set(validar_item_mcp(it) + validar_item_ranges(it)))
+        it2 = dict(it)
+        if w:
+            it2["warnings"] = w
         else:
-            raise RegraInvalida(
-                f"[{raiz}] item #{i} em '{chave_lista}' requer 'max_preco' ou 'max_kg' (ou 'otherwise')"
-            )
+            it2.pop("warnings", None)
+        it_out.append(it2)
+    doc2 = dict(doc)
+    doc2["itens"] = it_out
+    return doc2
 
-        if allow_percent and "valor_pct_do_preco" in item:
-            _pct_in_range(item["valor_pct_do_preco"], raiz, f"{chave_lista}[{i}].valor_pct_do_preco")
-        elif "valor" in item:
-            _nonneg_number(item["valor"], raiz, f"{chave_lista}[{i}].valor")
-        else:
-            ok = "valor_pct_do_preco" if allow_percent else "valor"
-            raise RegraInvalida(f"[{raiz}] item #{i} em '{chave_lista}' requer '{ok}'")
+# --- Aliases de compatibilidade (mantêm chamadas antigas vivas) ---
+def validar_insumos_mcp(item: dict) -> list[str]:
+    # nome legado → usa a função atual por item
+    return validar_item_mcp(item)
 
-
-def validate_regras_ml(data: Dict[str, Any]) -> None:
-    """
-    Valida a estrutura e os intervalos do YAML de Mercado Livre.
-    Levanta RegraInvalida (ValueError) em caso de problemas.
-    """
-    if not isinstance(data, dict):
-        raise RegraInvalida("Documento de regras deve ser um objeto (dict)")
-
-    # Top-level
-    _req_keys(data, ["canal", "default", "comissao", "full", "nao_full"], "regras_ml")
-
-    # default
-    default = data["default"]
-    if not isinstance(default, dict):
-        raise RegraInvalida("[default] deve ser objeto")
-    _req_keys(default, ["imposto_pct", "marketing_pct"], "default")
-    _pct_in_range(default["imposto_pct"], "default", "imposto_pct")
-    _pct_in_range(default["marketing_pct"], "default", "marketing_pct")
-
-    # comissao
-    comissao = data["comissao"]
-    if not isinstance(comissao, dict):
-        raise RegraInvalida("[comissao] deve ser objeto")
-    _req_keys(comissao, ["classico_pct"], "comissao")
-    _pct_in_range(comissao["classico_pct"], "comissao", "classico_pct")
-
-    # full
-    full = data["full"]
-    if not isinstance(full, dict):
-        raise RegraInvalida("[full] deve ser objeto")
-    if "custo_fixo_por_unidade_brl" not in full:
-        raise RegraInvalida("[full] requer 'custo_fixo_por_unidade_brl'")
-    _validate_faixas_valor(full["custo_fixo_por_unidade_brl"], "full", "custo_fixo_por_unidade_brl")
-
-    # nao_full
-    nf = data["nao_full"]
-    if not isinstance(nf, dict):
-        raise RegraInvalida("[nao_full] deve ser objeto")
-
-    # custo fixo por unidade (padrão de não-Full)
-    if "custo_fixo_por_unidade_brl" in nf:
-        _validate_faixas_valor(
-            nf["custo_fixo_por_unidade_brl"],
-            "nao_full",
-            "custo_fixo_por_unidade_brl",
-            allow_percent=True,
-        )
-
-    # frete_gratis_40538 (opcional, mas se existir, checar contrato)
-    if "frete_gratis_40538" in nf:
-        fg = nf["frete_gratis_40538"]
-        if not isinstance(fg, dict):
-            raise RegraInvalida("[nao_full.frete_gratis_40538] deve ser objeto")
-        _req_keys(fg, ["threshold_preco_brl", "tabelas_por_preco"], "nao_full.frete_gratis_40538")
-        _nonneg_number(fg["threshold_preco_brl"], "nao_full.frete_gratis_40538", "threshold_preco_brl")
-
-        tpp = fg["tabelas_por_preco"]
-        if not isinstance(tpp, dict):
-            raise RegraInvalida("[nao_full.frete_gratis_40538.tabelas_por_preco] deve ser objeto")
-
-        # Cada banda de preço tem faixas por peso
-        for banda, faixas in tpp.items():
-            if not isinstance(banda, str):
-                raise RegraInvalida("[nao_full.frete_gratis_40538.tabelas_por_preco] chave de banda deve ser string")
-            _validate_faixas_valor(
-                faixas,
-                f"nao_full.frete_gratis_40538['{banda}']",
-                "faixas_peso",
-                allow_percent=False,
-            )
+def anexar_warnings_mcp(documento: dict) -> dict:
+    # nome legado → usa o anotador atual por documento
+    return anotar_warnings_no_documento(documento)
