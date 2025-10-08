@@ -14,6 +14,13 @@ from app.config.paths import (
 from app.utils.core.io import salvar_json, ler_json
 from app.utils.meli.client import MeliClient
 
+import os
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 USO = "Uso: python -m scripts.vendas.meli_vendas_fetch_range [sp|mg] [--days 60]"
 
 def _parse_args(argv: list[str]) -> Tuple[str, int]:
@@ -58,7 +65,7 @@ def main(argv: list[str]) -> None:
     iso_from = dt_from.isoformat(timespec="seconds")   # ex.: 2025-07-01T00:00:00-03:00
     iso_to   = dt_to.isoformat(timespec="seconds")
 
-    print(f"→ Buscando pedidos de {loja.upper()} de {iso_from} até {iso_to} (fuso={APP_TIMEZONE})")
+    print(f"-> Buscando pedidos de {loja.upper()} de {iso_from} ate {iso_to} (fuso={APP_TIMEZONE})")
     data = client.search_orders_range(cfg.seller_id, iso_from, iso_to, limit=50)
 
     # Acrescenta metadados e salva no RAW fixo
@@ -74,7 +81,7 @@ def main(argv: list[str]) -> None:
     }
     out = vendas_raw_json(loja)
     salvar_json(out, payload)  # atômico + backup
-    print(f"✓ RAW atualizado: {out} | total={payload['paging'].get('total', len(payload['results']))}")
+    print(f"[OK] RAW atualizado: {out} | total={len(payload['results'])}")
 
 if __name__ == "__main__":
     main(sys.argv)

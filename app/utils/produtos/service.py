@@ -105,3 +105,38 @@ def listar_produtos_normalizado() -> Dict[str, Dict[str, Any]]:
                 rec2[k] = v
         out[sku] = rec2
     return out
+
+# --- Helpers por GTIN (enriquecimento para reposição) ---
+
+def get_por_gtin(gtin: str, camada: Camada = Camada.PP) -> Optional[Dict[str, Any]]:
+    """
+    Retorna o registro completo do produto com esse GTIN (quando houver).
+    """
+    for rec in get_itens(camada).values():
+        if rec.get("gtin") == gtin:
+            return rec
+    return None
+
+def get_pack_info_por_gtin(gtin: str, camada: Camada = Camada.PP) -> Dict[str, Any]:
+    """
+    Extrai os campos relevantes para planejamento de compra/reposição.
+    Campos: preco_compra, multiplo_compra, caixa_cm, pesos_caixa_g, pesos_g, dimensoes_cm.
+    Retorna dicionário só com os campos encontrados (pode vir vazio).
+    """
+    rec = get_por_gtin(gtin, camada)
+    if not rec:
+        return {}
+    keys = [
+        "preco_compra",
+        "multiplo_compra",
+        "caixa_cm",
+        "pesos_caixa_g",
+        "pesos_g",
+        "dimensoes_cm",
+    ]
+    out = {}
+    for k in keys:
+        v = rec.get(k)
+        if v not in (None, "", []):
+            out[k] = v
+    return out

@@ -37,7 +37,7 @@ def main(argv: list[str]) -> None:
     cid, csec = meli_client_credentials(loja)
 
     client = MeliClient(at, rt, cid, csec, api_base=ML_API_BASE)
-    print(f"→ Buscando 1 venda ({loja.upper()}) seller_id={cfg.seller_id}")
+    print(f"-> Buscando 1 venda ({loja.upper()}) seller_id={cfg.seller_id}")
     resp = client.get_last_order(cfg.seller_id)
 
     # RAW fixo

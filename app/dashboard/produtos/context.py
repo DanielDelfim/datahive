@@ -24,14 +24,24 @@ def _filtrar_busca(regs: List[Dict[str, Any]], txt: str):
         )
     return [r for r in regs if ok(r)]
 
+def _filtrar_regiao(regs: List[Dict[str, Any]], regiao: Optional[Regiao]):
+    if not regiao:
+        return regs
+    # se o PP tiver campo 'regiao', filtra; senão, mantém (PP transversal)
+    alvo = regiao.value.lower()
+    def ok(r):
+        v = (r.get("regiao") or "").lower()
+        return v == alvo if v else True
+    return [r for r in regs if ok(r)]
+
 @st.cache_data(show_spinner=False)
 def _load_produtos(_regiao: Optional[Regiao]):
-    # Nota: PP é “transversal” ao filtro de região; mantemos arg p/ consistência de assinatura
     items = get_itens()  # dict {sku: {...}}
     return [{**v, "sku": k} for k, v in items.items()]
 
 def make_context(regiao: Optional[Regiao], busca: str, somente_com_custo: bool) -> ProdutoCtx:
     regs = _load_produtos(regiao)
+    regs = _filtrar_regiao(regs, regiao)
     if somente_com_custo:
         regs = [r for r in regs if isinstance(r.get("preco_compra") or r.get("custo"), (int, float))]
     if busca:
