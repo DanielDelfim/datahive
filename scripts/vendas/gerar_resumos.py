@@ -3,12 +3,20 @@ from __future__ import annotations
 import sys
 from typing import Dict, Iterable, Tuple, Optional, Any
 import json
+import argparse
 
-from app.config.paths import ensure_dirs, vendas_resumo_json, vendas_por_mlb_json, pp_dir
+from app.config.paths import vendas_resumo_json, vendas_por_mlb_json
 from app.utils.core.io import atomic_write_json
 from app.services.vendas_service import get_resumos, get_por_mlb
 
 from app.config.paths import anuncios_pp_json, Marketplace, Regiao
+
+import os
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 USO = ("Uso: python -m scripts.vendas.gerar_resumos [sp|mg] "
        "[--windows 7,15,30] [--mlb MLB...] [--sku SKU...] [--title \"texto\"]")
@@ -145,36 +153,33 @@ def _parse_args(argv: list[str]) -> Tuple[str, Iterable[int], Optional[str], Opt
             title = argv[i + 1].strip()
     return loja, windows, mlb, sku, title
 
-def main(argv: list[str]) -> None:
-    ensure_dirs()
-    loja, windows, mlb, sku, title = _parse_args(argv)
+def main(argv):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("loja", choices=("sp", "mg"))
+    ap.add_argument("--materializar", action="store_true",
+                    help="Se presente, grava JSONs auxiliares; caso contrário, só imprime/loga.")
+    args = ap.parse_args(argv[1:])
 
-    # 1) Resumo por janelas — SOMENTE datas, MODO ML (inclui HOJE e o 1º dia inteiro)  :contentReference[oaicite:13]{index=13}
-    resumo = get_resumos(loja, windows, mode="ml")
-    out_resumo = vendas_resumo_json(loja)
-    pp_dir(loja).mkdir(parents=True, exist_ok=True)
-    atomic_write_json(out_resumo, resumo, do_backup=True)
-    print(f"✓ resumo_windows salvo: {out_resumo}")
+    # calcula em memória usando o service
+    por_mlb = get_por_mlb(args.loja, windows=(7, 15, 30))
+    resumo_windows = get_resumos(args.loja, windows=(7, 15, 30))
 
-    # 2) Agregado por MLB — janelas no MODO ML  :contentReference[oaicite:14]{index=14}
-    por_mlb = get_por_mlb(loja, windows, mode="ml")
-
-    # 2.1) NOVO — carregar estoque por MLB a partir do PP de Anúncios  :contentReference[oaicite:15]{index=15} :contentReference[oaicite:16]{index=16}
-    estoque_map = _carregar_estoque_por_mlb(loja)
-
-    # 2.2) NOVO — injetar sugestão de reposição (cobertura 30d e 60d) usando média 30d
-    por_mlb_enriquecido = _injetar_reposicao(por_mlb, estoque_map)
-
-    out_mlb = vendas_por_mlb_json(loja)
-    atomic_write_json(out_mlb, por_mlb_enriquecido, do_backup=True)
-    print(f"✓ por_mlb (com reposição 30/60d) salvo: {out_mlb}")
+    if args.materializar:
+        # grava SOMENTE se flag for passada
+        out_por_mlb = vendas_por_mlb_json(args.loja)      # caminho helper do seu config/paths
+        out_resumo  = vendas_resumo_json(args.loja)       # idem (se quiser manter um deles)
+        atomic_write_json(out_por_mlb, por_mlb, do_backup=True)
+        atomic_write_json(out_resumo, resumo_windows, do_backup=True)
+        print(f"[OK] JSONs auxiliares materializados: {out_por_mlb} | {out_resumo}")
+    else:
+        # padrão: sem escrita
+        print(f"[OK] Resumos calculados em memória (loja={args.loja}); nada gravado.")
+        # opcional: logar 3 números úteis
+        total_7  = resumo_windows["result"]["7"]["qty_total"]
+        total_15 = resumo_windows["result"]["15"]["qty_total"]
+        total_30 = resumo_windows["result"]["30"]["qty_total"]
+        print(f"Totais qty (7/15/30): {total_7}/{total_15}/{total_30}")
 
 if __name__ == "__main__":
-    try:
-        main(sys.argv)
-    except SystemExit as e:
-        print(str(e) or USO)
-        raise
-    except Exception as e:
-        print(f"✗ ERRO: {e}")
-        raise
+    import sys
+    main(sys.argv)
