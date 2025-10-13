@@ -10,12 +10,41 @@ from app.config.paths import DATA_DIR, Marketplace, Regiao, Camada
 # ======= Regras do domínio (YAML) =======
 REGRAS_DIR = Path("app") / "utils" / "precificacao" / "regras"
 REGRAS_ML_YAML = REGRAS_DIR / "mercado_livre.yaml"
+REGRAS_OVERRIDES_YAML = REGRAS_DIR / "overrides.yaml"
+
+def get_overrides_yaml_path() -> Path:
+    return REGRAS_OVERRIDES_YAML
 
 # ======= Período (para _meta) =======
 @dataclass(frozen=True)
 class Periodo:
     ano: int
     mes: int
+
+_OVERRIDES_CACHE = None
+
+def reset_overrides_cache():
+    global _OVERRIDES_CACHE
+    _OVERRIDES_CACHE = None
+
+def get_overrides_ml() -> dict:
+    """
+    Carrega overrides.yaml (se existir). Retorna {} se ausente.
+    Chaves esperadas:
+      - por_item: { <mlb|sku|gtin>: { ...*_override, vigencia?, campanha_id? } }
+      - cenarios: { <nome>: { ...*_override } }
+    """
+    global _OVERRIDES_CACHE
+    if _OVERRIDES_CACHE is not None:
+        return _OVERRIDES_CACHE
+    import yaml  # PyYAML
+    p = get_overrides_yaml_path()
+    if not p.exists():
+        _OVERRIDES_CACHE = {}
+        return _OVERRIDES_CACHE
+    with open(p, "r", encoding="utf-8") as f:
+        _OVERRIDES_CACHE = yaml.safe_load(f) or {}
+    return _OVERRIDES_CACHE
 
 def _reg(reg: Union[Regiao, str]) -> str:
     return reg.value if isinstance(reg, Regiao) else str(reg).lower()

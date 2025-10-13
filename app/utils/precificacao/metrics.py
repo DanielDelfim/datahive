@@ -1,8 +1,6 @@
-
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
-
+from typing import Any, Dict, List, Optional, Tuple
 import math
 import yaml
 
@@ -35,11 +33,30 @@ def _pct(v) -> float:
         return 0.0
 
 
+def clamp_percent(x: Optional[float]) -> Optional[float]:
+    if x is None:
+        return None
+    return max(0.0, min(1.0, x))
+
+
+def _num(x, default=None):
+    if x is None:
+        return default
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
 # =========================
-# Regras (local, sem importar service.py)
+# Leitura de regras (YAML)
 # =========================
 
 def carregar_regras_ml() -> dict:
+    """
+    Carrega o arquivo de regras do ML (tiers de FULL, comissões, defaults, etc.)
+    Mantém este módulo puro (sem depender de service.py).
+    """
     yaml_path = get_regras_meli_yaml_path()
     with open(yaml_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
@@ -59,7 +76,7 @@ def _is_full_item(it: Dict[str, Any]) -> bool:
 
 def custo_fixo_full(preco: float | None, regras: dict) -> float:
     """
-    Retorna o custo fixo FULL (R$) de acordo com as faixas do YAML:
+    Retorna o custo fixo FULL (R$) de acordo com faixas do YAML:
       full.custo_fixo_por_unidade_brl: [{max_preco, valor}, ..., {otherwise: true, valor}]
     """
     tiers = (regras or {}).get("full", {}).get("custo_fixo_por_unidade_brl", []) or []
@@ -68,7 +85,6 @@ def custo_fixo_full(preco: float | None, regras: dict) -> float:
     except (TypeError, ValueError):
         return 0.0
 
-    # Faixas com limite superior (<= max_preco)
     for t in tiers:
         if "max_preco" in t and t["max_preco"] is not None:
             try:
@@ -77,7 +93,6 @@ def custo_fixo_full(preco: float | None, regras: dict) -> float:
             except (TypeError, ValueError):
                 continue
 
-    # Fallback "otherwise"
     for t in tiers:
         if t.get("otherwise"):
             try:
@@ -86,23 +101,25 @@ def custo_fixo_full(preco: float | None, regras: dict) -> float:
                 return 0.0
     return 0.0
 
-def _num(x, default=None):
-    """Converte para float, mantendo None quando faltar informação crítica."""
-    if x is None:
-        return default
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return default
 
 # =========================
-# Preço efetivo
+# Preço efetivo & subsídio
 # =========================
+
+def preco_efetivo(preco_cheio, rebate_price_discounted, considerar_rebate=True) -> Optional[float]:
+    """Preço efetivo = rebate (se considerar e válido) senão preço cheio; jamais <= 0."""
+    p = None
+    if considerar_rebate and rebate_price_discounted not in (None, ""):
+        p = _num(rebate_price_discounted)
+    if p is None:
+        p = _num(preco_cheio)
+    if p is None or p <= 0:
+        return None
+    return p
+
 
 def subsidio_ml_valor(price, rebate_price_discounted, considerar_rebate=True) -> Optional[float]:
-    """
-    Subsídio do ML em VALOR (R$): max(price - rebate, 0) quando considerar_rebate=True.
-    """
+    """Subsídio do ML em valor (R$): max(price - rebate, 0) quando considerar_rebate=True."""
     if not considerar_rebate:
         return None
     p = _num(price)
@@ -114,51 +131,8 @@ def subsidio_ml_valor(price, rebate_price_discounted, considerar_rebate=True) ->
     return max(0.0, p - r)
 
 
-def _alocar_subsidio_sobre_taxas(
-    subs_valor: float,
-    base_comissao_brl: float,
-    base_marketing_brl: float,
-    base_imposto_brl: float,
-    ordem_campos: list[str],
-) -> tuple[float, float, float, dict]:
-    """
-    Aloca o subsídio (R$) abatendo a soma das taxas na ordem indicada.
-    Não deixa nenhum custo ficar negativo. Retorna (comissao_aj, marketing_aj, imposto_aj, aloc_map).
-    ordem_campos: p.ex. ["comissao"] ou ["comissao","marketing","imposto"].
-    """
-    rem = max(0.0, float(subs_valor))
-    c, m, i = float(base_comissao_brl or 0), float(base_marketing_brl or 0), float(base_imposto_brl or 0)
-    alloc = {"comissao": 0.0, "marketing": 0.0, "imposto": 0.0}
-
-    for campo in ordem_campos:
-        if rem <= 0:
-            break
-        if campo == "comissao":
-            ded = min(rem, c); c -= ded; rem -= ded; alloc["comissao"] += ded
-        elif campo == "marketing":
-            ded = min(rem, m); m -= ded; rem -= ded; alloc["marketing"] += ded
-        elif campo == "imposto":
-            ded = min(rem, i); i -= ded; rem -= ded; alloc["imposto"] += ded
-
-    return c, m, i, alloc
-
-
-def preco_efetivo(preco_cheio, rebate_price_discounted, considerar_rebate=True) -> Optional[float]:
-    """Escolhe o preço válido: rebate (se houver e considerar), senão cheio; não deixa <=0."""
-    p = None
-    if considerar_rebate and rebate_price_discounted not in (None, ""):
-        p = _num(rebate_price_discounted)
-    if p is None:
-        p = _num(preco_cheio)
-    if p is None or p <= 0:
-        return None
-    return p
-
 def subsidio_ml_taxa(price, rebate_price_discounted, considerar_rebate=True) -> Optional[float]:
-    """
-    Retorna a taxa de subsídio do ML (0..1) quando o rebate for menor que o preço cheio.
-    Ex.: price=100, rebate=92  ->  0.08  (8%)
-    """
+    """Taxa de subsídio (0..1): 1 - rebate/price, se rebate < price."""
     try:
         if not considerar_rebate:
             return None
@@ -172,16 +146,55 @@ def subsidio_ml_taxa(price, rebate_price_discounted, considerar_rebate=True) -> 
     except Exception:
         return None
 
-def clamp_percent(x: Optional[float]) -> Optional[float]:
-    if x is None:
-        return None
-    # evita taxas absurdas por erro de origem
-    return max(0.0, min(1.0, x))
+
+def _alocar_subsidio_sobre_taxas(
+    subs_valor: float,
+    base_comissao_brl: float,
+    base_marketing_brl: float,
+    base_imposto_brl: float,
+    ordem_campos: List[str],
+) -> Tuple[float, float, float, dict]:
+    """
+    Abate o subsídio (R$) na ordem definida: p.ex. ["comissao"] ou ["comissao","marketing","imposto"].
+    Nunca negativar custos. Retorna (comissao_aj, marketing_aj, imposto_aj, alloc_map).
+    """
+    rem = max(0.0, float(subs_valor))
+    c, m, i = float(base_comissao_brl or 0), float(base_marketing_brl or 0), float(base_imposto_brl or 0)
+    alloc = {"comissao": 0.0, "marketing": 0.0, "imposto": 0.0}
+
+    for campo in ordem_campos:
+        if rem <= 0:
+            break
+        if campo == "comissao":
+            ded = min(rem, c)
+            c -= ded
+            rem -= ded
+            alloc["comissao"] += ded
+        elif campo == "marketing":
+            ded = min(rem, m)
+            m -= ded
+            rem -= ded
+            alloc["marketing"] += ded
+        elif campo == "imposto":
+            ded = min(rem, i)
+            i -= ded
+            rem -= ded
+            alloc["imposto"] += ded
+
+    return c, m, i, alloc
+
+
+# =========================
+# Custo total & MCP
+# =========================
 
 def custo_total(preco_compra,
                 frete=0, comissao_pct=0, imposto_pct=0, marketing_pct=0,
-                custo_fixo_full=0) -> Optional[float]:
-    """Soma custos. Percentuais devem vir em [0,1]. Se preço_compra faltar, devolve None."""
+                custo_fixo_full=0) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Retorna (ct_base, comissao_pct, imposto_pct, marketing_pct).
+    ct_base = preco_compra + frete + custo_fixo_full
+    """
     pc = _num(preco_compra)
     if pc is None or pc < 0:
         return None
@@ -192,15 +205,15 @@ def custo_total(preco_compra,
     i = clamp_percent(_num(imposto_pct, 0.0))
     m = clamp_percent(_num(marketing_pct, 0.0))
 
-    # Percentuais incidem sobre preço de venda (trataremos fora com o preço efetivo)
     return pc + fr + cf, c, i, m
+
 
 def mcp(preco_venda_efetivo: Optional[float],
         preco_compra: Optional[float],
         frete=0, comissao_pct=0, imposto_pct=0, marketing_pct=0,
         custo_fixo_full=0) -> dict:
     """
-    Retorna dict com mcp_abs, mcp_pct (ou ambos None) + 'null_reasons' se algo impedir o cálculo.
+    Retorna dict com mcp_abs, mcp_pct (ou ambos None) + 'null_reasons' quando não calculável.
     """
     reasons = []
     pv = _num(preco_venda_efetivo)
@@ -214,27 +227,22 @@ def mcp(preco_venda_efetivo: Optional[float],
         return {"mcp_abs": None, "mcp_pct": None, "null_reasons": reasons}
 
     ct_base, c, i, m = ct_tuple
-    # percentuais incidem sobre o preço de venda efetivo
     custos_percentuais = (c or 0) * pv + (i or 0) * pv + (m or 0) * pv
     ct = ct_base + custos_percentuais
 
     m_abs = pv - ct
-    # proteção: se pv ~ 0, já teria retornado acima
     m_pct = m_abs / pv
 
     return {"mcp_abs": m_abs, "mcp_pct": m_pct, "null_reasons": reasons}
 
-# =========================
-# Núcleo de métricas por item
-# =========================
 
-# --- no topo do arquivo já devem existir seus imports e helpers ---
-
-# app/utils/precificacao/metrics.py  (substituir a função inteira)
+# =========================
+# Núcleo por item (com overrides)
+# =========================
 
 def calcular_metricas_item(item: dict, *args, **kwargs) -> dict:
     """
-    Calcula MCP por item e anota custos absolutos, incluindo subsídio do ML em R$.
+    Calcula MCP por item e anota custos absolutos, priorizando chaves *_override quando presentes.
     Compat:
       - calcular_metricas_item(item)
       - calcular_metricas_item(item, True/False)                      # considerar_rebate
@@ -242,7 +250,7 @@ def calcular_metricas_item(item: dict, *args, **kwargs) -> dict:
       - calcular_metricas_item(item, use_rebate_as_price=True/False)  # alias legado
       - calcular_metricas_item(item, regras=<dict>)                   # regras YAML (opcional)
     """
-    # --- 1) Flags/kwargs de compatibilidade ---
+    # --- 1) Flags/kwargs ---
     considerar_rebate = kwargs.pop("considerar_rebate", None)
     alias = kwargs.pop("use_rebate_as_price", None)
     if considerar_rebate is None:
@@ -257,10 +265,21 @@ def calcular_metricas_item(item: dict, *args, **kwargs) -> dict:
     regras = kwargs.get("regras") or carregar_regras_ml()
     default = (regras or {}).get("default", {}) or {}
     cfg_comissao = (regras or {}).get("comissao", {}) or {}
-    # onde abater o subsídio: lista de campos, default só "comissao"
     aplicar_em = default.get("aplicar_subsidio_em") or ["comissao"]
     if isinstance(aplicar_em, str):
         aplicar_em = [aplicar_em]
+
+    # Helpers de override
+    def _num_or_none(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    def _pick_override(d: dict, key_base: str):
+        """Ex.: key_base='comissao_pct' -> usa d['comissao_pct_override'] se existir."""
+        cand = d.get(f"{key_base}_override")
+        return _num_or_none(cand)
 
     # --- 3) Preço efetivo + subsídios ---
     price  = item.get("price")
@@ -270,14 +289,9 @@ def calcular_metricas_item(item: dict, *args, **kwargs) -> dict:
         item["preco_efetivo"] = pe
 
     subs_valor = subsidio_ml_valor(price, rebate, considerar_rebate=considerar_rebate)
-    subs_tx    = None
-    if subs_valor is not None and _num(price):
-        try:
-            subs_tx = max(0.0, subs_valor / float(price))
-        except Exception:
-            subs_tx = None
+    subs_tx    = subsidio_ml_taxa(price, rebate, considerar_rebate=considerar_rebate)
 
-    # --- 4) Percentuais (0..1), com overrides do item quando presentes ---
+    # --- 4) Percentuais (com overrides) ---
     def _pct_or_default(key, fallback):
         v = _to_num(item.get(key))
         return clamp_percent(v if v is not None else fallback)
@@ -290,42 +304,55 @@ def calcular_metricas_item(item: dict, *args, **kwargs) -> dict:
         comissao_base = cfg_comissao.get("seller") or cfg_comissao.get("classico_pct") \
                         or default.get("comissao_pct")
 
-    comissao_pct  = _pct_or_default("comissao_pct", _pct(comissao_base))
-    imposto_pct   = _pct_or_default("imposto_pct",  _pct(default.get("imposto_pct")))
-    marketing_pct = _pct_or_default("marketing_pct",_pct(default.get("marketing_pct")))
+    ov_com = _pick_override(item, "comissao_pct")
+    ov_imp = _pick_override(item, "imposto_pct")
+    ov_mkt = _pick_override(item, "marketing_pct")
 
-    # --- 5) Frete sobre custo ---
+    comissao_pct  = clamp_percent(ov_com if ov_com is not None else _pct_or_default("comissao_pct", _pct(comissao_base)))
+    imposto_pct   = clamp_percent(ov_imp if ov_imp is not None else _pct_or_default("imposto_pct",  _pct(default.get("imposto_pct"))))
+    marketing_pct = clamp_percent(ov_mkt if ov_mkt is not None else _pct_or_default("marketing_pct",_pct(default.get("marketing_pct"))))
+
+    # --- 5) Frete (com override) ---
     preco_compra = item.get("preco_compra")
-    frete_val = _to_num(item.get("frete_full"))
+
+    ov_frete = _pick_override(item, "frete_full")
+    if ov_frete is None:
+        ov_frete = _pick_override(item, "frete_sobre_custo")
+
+    frete_val = ov_frete
+    if frete_val is None:
+        frete_val = _to_num(item.get("frete_full"))
     if frete_val is None:
         frete_val = _to_num(item.get("frete_sobre_custo"))
     if frete_val is None:
-        fr_pct = _pct(default.get("frete_pct_sobre_custo"))
+        fr_pct  = _pct(default.get("frete_pct_sobre_custo"))
         fr_base = _to_num(preco_compra) or 0.0
         frete_val = fr_base * fr_pct
 
-    # --- 6) Custos variáveis (R$) sobre o preço efetivo (antes do subsídio) ---
+    # --- 6) Custos variáveis brutos (antes do subsídio), se houver preço efetivo ---
     if pe is not None:
-        imposto_val_base   = (imposto_pct   * pe)
-        marketing_val_base = (marketing_pct * pe)
-        comissao_val_base  = (comissao_pct  * pe)
+        imposto_val_base   = (imposto_pct   or 0.0) * pe
+        marketing_val_base = (marketing_pct or 0.0) * pe
+        comissao_val_base  = (comissao_pct  or 0.0) * pe
     else:
         imposto_val_base = marketing_val_base = comissao_val_base = None
 
-    # --- 7) Aplicação do subsídio EM VALOR sobre as taxas (sem negativar) ---
+    # --- 7) Aplicação do subsídio em valor sobre as taxas ---
     if pe is not None and subs_valor and subs_valor > 0:
         c_adj, m_adj, i_adj, alloc = _alocar_subsidio_sobre_taxas(
             subs_valor,
             comissao_val_base or 0.0,
             marketing_val_base or 0.0,
             imposto_val_base or 0.0,
-            ordem_campos=aplicar_em,   # ex.: ["comissao"] ou ["comissao","marketing","imposto"]
+            ordem_campos=aplicar_em,
         )
     else:
-        c_adj, m_adj, i_adj = comissao_val_base or 0.0, marketing_val_base or 0.0, imposto_val_base or 0.0
+        c_adj = comissao_val_base or 0.0
+        m_adj = marketing_val_base or 0.0
+        i_adj = imposto_val_base  or 0.0
         alloc = {"comissao": 0.0, "marketing": 0.0, "imposto": 0.0}
 
-    # Deriva percentuais efetivos APÓS subsídio (para alimentar o MCP)
+    # Percentuais efetivos após subsídio
     if pe and pe > 0:
         comissao_pct_eff  = c_adj / pe
         marketing_pct_eff = m_adj / pe
@@ -333,7 +360,20 @@ def calcular_metricas_item(item: dict, *args, **kwargs) -> dict:
     else:
         comissao_pct_eff = marketing_pct_eff = imposto_pct_eff = 0.0
 
-    # --- 8) MCP (usando percentuais AJUSTADOS) ---
+    # --- 8) Custo fixo FULL (com override) ---
+    ov_fix = _pick_override(item, "custo_fixo_full")  # R$/unid
+    if _is_full_item(item):
+        if ov_fix is not None:
+            fixo_val = float(ov_fix)
+            fixo_origem = "override"
+        else:
+            fixo_val = float(custo_fixo_full(pe, regras) if pe is not None else 0.0)
+            fixo_origem = "yaml"
+    else:
+        fixo_val = 0.0
+        fixo_origem = "nao_full"
+
+    # --- 9) MCP (usando percentuais AJUSTADOS e fixo FULL já decidido) ---
     res = mcp(
         preco_venda_efetivo=pe,
         preco_compra=preco_compra,
@@ -341,10 +381,10 @@ def calcular_metricas_item(item: dict, *args, **kwargs) -> dict:
         comissao_pct=comissao_pct_eff,
         imposto_pct=imposto_pct_eff,
         marketing_pct=marketing_pct_eff,
-        custo_fixo_full=float(custo_fixo_full(pe, regras)) if _is_full_item(item) else 0.0,
+        custo_fixo_full=fixo_val,
     )
 
-    # --- 9) Saída padronizada ---
+    # --- 10) Saída padronizada ---
     out = {
         "preco_efetivo": pe,
         "mcp_abs": res.get("mcp_abs"),
@@ -362,10 +402,11 @@ def calcular_metricas_item(item: dict, *args, **kwargs) -> dict:
         "comissao_pct": comissao_pct_eff,
 
         # controles
-        "custo_fixo_full": float(custo_fixo_full(pe, regras)) if _is_full_item(item) else None,
+        "custo_fixo_full": fixo_val if _is_full_item(item) else None,
+        "custo_fixo_full_origem": fixo_origem,
         "frete_sobre_custo": frete_val,
 
-        # subsídio em valor e taxa (para exibir no dashboard)
+        # subsídio em valor e taxa
         "subsidio_ml_valor": subs_valor,
         "subsidio_ml_taxa":  subs_tx,
 
@@ -373,14 +414,12 @@ def calcular_metricas_item(item: dict, *args, **kwargs) -> dict:
         "comissao_bruta":  comissao_val_base,
         "marketing_bruta": marketing_val_base,
         "imposto_bruta":   imposto_val_base,
-        "subsidio_alocado": alloc,   # quanto foi abatido de cada taxa
+        "subsidio_alocado": alloc,
         "aplicar_subsidio_em": aplicar_em,
     }
     if res.get("null_reasons"):
         out["mcp_null_reasons"] = res["null_reasons"]
     return out
-
-
 
 
 # =========================
@@ -399,7 +438,10 @@ def agregar_metricas_documento(itens: List[Dict[str, Any]]) -> Dict[str, Any]:
 # Compat: aplicar_metricas_no_documento (legado)
 # =========================
 
-def aplicar_metricas_no_documento(documento: Dict[str, Any], *, regras: dict | None = None, only_full: bool = False, use_rebate_as_price: bool = True) -> Dict[str, Any]:
+def aplicar_metricas_no_documento(documento: Dict[str, Any], *,
+                                  regras: dict | None = None,
+                                  only_full: bool = False,
+                                  use_rebate_as_price: bool = True) -> Dict[str, Any]:
     if regras is None:
         regras = carregar_regras_ml()
 
@@ -419,4 +461,3 @@ def aplicar_metricas_no_documento(documento: Dict[str, Any], *, regras: dict | N
     doc2["itens"] = itens_out
     doc2["metrics"] = agregar_metricas_documento(itens_out)
     return doc2
-

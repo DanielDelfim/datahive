@@ -17,6 +17,9 @@ import hashlib
 import json
 import sys
 from typing import Dict, Any
+from pathlib import Path
+from decimal import Decimal
+import numpy as np
 
 from datetime import datetime, timezone
 
@@ -40,12 +43,6 @@ REGIAO = None  # Produtos PP é transversal; pode ser "br" ou None
 SCHEMA_VERSION = "1.0.0"
 SCRIPT_NAME = "scripts/produtos/gerar_produtos_pp.py"
 SCRIPT_VERSION = "1.0.0"
-
-# --- NOVO util: sanitização recursiva p/ JSON ---
-from pathlib import Path
-from decimal import Decimal
-import numpy as np
-
 
 def _to_jsonable(obj):
     """Converte recursivamente valores não-serializáveis (Path, Decimal, numpy, sets) em tipos JSON."""

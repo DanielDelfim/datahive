@@ -1,4 +1,4 @@
-
+#C:\Apps\Datahive\scripts\anuncios\meli\atualizar_raw.py
 from __future__ import annotations
 
 import argparse
@@ -51,6 +51,56 @@ def _build_client(loja: str) -> tuple[MeliClient, str]:
     )
     return cli, cfg.seller_id
 
+def _fetch_all_item_ids(cli, seller_id: str) -> list[str]:
+    """
+    Varre TODOS os itens do seller usando cursor (scan + scroll_id), sem filtrar por status.
+    """
+    ids: list[str] = []
+    scroll_id = None
+    while True:
+        params = {"seller_id": seller_id, "limit": 100, "search_type": "scan"}
+        if scroll_id:
+            params["scroll_id"] = scroll_id
+        # >>> AQUI: interpolar o seller_id!
+        resp = cli.get(f"/users/{seller_id}/items/search", params=params)
+        batch = resp.get("results") or []
+        ids.extend([str(x) for x in batch])
+        scroll_id = resp.get("scroll_id")
+        if not batch or not scroll_id:
+            break
+    # dedupe preservando ordem
+    seen, out = set(), []
+    for i in ids:
+        if i and i not in seen:
+            seen.add(i)
+            out.append(i)
+    logging.info("SCAN seller=%s → %d IDs", seller_id, len(out))
+    return out
+
+def _rescue_ids_by_gtin(cli, seller_id: str, gtin: str) -> list[str]:
+    """
+    Tenta localizar IDs do seller pelo GTIN:
+    1) /users/{seller_id}/items/search?q=<gtin>
+    2) /sites/MLB/search?q=<gtin>&seller_id=<seller_id>
+    Retorna lista (pode vir 1 id).
+    """
+    ids = []
+
+    # 1) search no /users
+    r1 = cli.get(f"/users/{seller_id}/items/search", params={"q": gtin, "limit": 100})
+    ids += [str(x) for x in (r1.get("results") or [])]
+
+    # 2) search no /sites (às vezes encontra onde /users não traz)
+    r2 = cli.get("/sites/MLB/search", params={"q": gtin, "seller_id": seller_id, "limit": 50})
+    ids += [str(x.get('id')) for x in (r2.get("results") or []) if isinstance(x, dict) and x.get('id')]
+
+    # dedupe
+    seen, out = set(), []
+    for i in ids:
+        if i and i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
 
 def _fetch_all_items(cli: MeliClient, seller_id: str) -> List[str]:
     logging.info("Listando MLBs do seller %s ...", seller_id)
@@ -73,29 +123,75 @@ def _fetch_all_items(cli: MeliClient, seller_id: str) -> List[str]:
         )
     return ids  # <<< FALTAVA ESTE RETURN
 
+def _has_gtin(item: dict, gtin: str) -> bool:
+    g = str(item.get("gtin") or "").strip()
+    if g == gtin: 
+        return True
+    for a in (item.get("attributes") or []):
+        name = str(a.get("name") or a.get("id") or "").lower()
+        if "ean" in name or "gtin" in name or "barcode" in name:
+            v = str(a.get("value_name") or a.get("value_id") or a.get("value") or "").strip()
+            if v == gtin:
+                return True
+            vals = a.get("values") or []
+            if vals and str(vals[0].get("name") or "").strip() == gtin:
+                return True
+    return False
 
-
-def _fetch_items_details(cli: MeliClient, ids: List[str]) -> List[Dict[str, Any]]:
+def _fetch_items_details(cli: MeliClient, ids: list[str]) -> list[dict]:
+    import logging
     logging.info("Baixando detalhes em lote ...")
-    items = cli.get_items_bulk(ids)
 
-    # dedup por 'id' preservando ordem
-    seen, items_dedup = set(), []
+    resp = cli.get_items_bulk(ids)  # pode vir [{"code":200,"body":{...}}, {"code":404,...}, ...]
+    items, misses = [], []
+
+    # 1) Desembrulhar {code, body} e coletar "misses"
+    for r in resp:
+        if isinstance(r, dict) and "body" in r:
+            code = r.get("code", 200)
+            body = r.get("body")
+            if code == 200 and isinstance(body, dict) and body.get("id"):
+                items.append(body)
+            else:
+                misses.append(r)
+        elif isinstance(r, dict) and r.get("id"):
+            items.append(r)
+        else:
+            misses.append(r)
+
+    # 2) Recuperar misses individualmente via GET /items/{id}, quando possível
+    recov = []
+    for m in misses:
+        # tenta extrair o id que falhou
+        mid = None
+        if isinstance(m, dict):
+            if "body" in m and isinstance(m["body"], dict):
+                mid = m["body"].get("id")
+            mid = mid or m.get("id") or m.get("item_id") or m.get("requested_id")
+        if mid:
+            try:
+                one = cli.get_item(mid)  # GET /items/{id}
+                if isinstance(one, dict) and one.get("id"):
+                    recov.append(one)
+            except Exception:
+                pass
+
+    if recov:
+        logging.warning("Recuperados individualmente %d itens que falharam no bulk.", len(recov))
+        items.extend(recov)
+
+    # 3) Dedupe por 'id' preservando ordem
+    seen, dedup = set(), []
     for it in items:
         k = str(it.get("id") or "")
         if k and k not in seen:
             seen.add(k)
-            items_dedup.append(it)
+            dedup.append(it)
 
-    if len(items_dedup) != len(items):
-        logging.info(
-            "Removidos %d itens duplicados após o bulk (de %d para %d).",
-            len(items) - len(items_dedup), len(items), len(items_dedup)
-        )
-    return items_dedup  # <<< FALTAVA ESTE RETURN
+    if len(dedup) != len(items):
+        logging.info("Removidos %d duplicados no bulk (de %d para %d).", len(items)-len(dedup), len(items), len(dedup))
 
-
-
+    return dedup
 
 def _persist_raw(regiao: Regiao, payload: Dict[str, Any]) -> Path:
     target = anuncios_json(Marketplace.MELI, Camada.RAW, regiao)
@@ -119,6 +215,17 @@ def run_for_regiao(regiao: Regiao) -> Path:
 
     ids = _fetch_all_items(cli, seller_id)          # agora retorna dedup
     items = _fetch_items_details(cli, ids)          # agora retorna dedup
+
+    # Rescue opcional por GTIN(s)
+    watch_gtins = getattr(anuncios_cfg, "WATCH_GTINS", [])  # ou passe por CLI
+    for g in watch_gtins:
+        if not any(_has_gtin(it, g) for it in items):
+            rescue_ids = _rescue_ids_by_gtin(cli, seller_id, g)
+            if rescue_ids:
+                rescued = _fetch_items_details(cli, rescue_ids)
+                for r in rescued:
+                    if isinstance(r, dict) and r.get("id"):
+                        items.append(r)
 
     # blindagem extra antes de gravar
     seen, unique_items = set(), []

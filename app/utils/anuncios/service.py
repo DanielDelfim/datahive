@@ -11,6 +11,7 @@ from app.config.paths import Regiao, Camada
 from app.utils.core.io import ler_json
 from . import config as ancfg  # paths do domínio (anuncios)
 from pathlib import Path
+from app.config.paths import Marketplace
 
 # ------------------- helpers internos -------------------
 
@@ -48,7 +49,7 @@ def _pp_path_for(regiao: Regiao) -> Optional["Path"]:
     try:
         # Alternativa: helper transversal do domínio de anúncios
         if hasattr(ancfg, "anuncios_json"):
-            return ancfg.anuncios_json(market="meli", camada=Camada.PP, regiao=regiao)
+            return ancfg.anuncios_json(market=Marketplace.MELI, camada=Camada.PP, regiao=regiao)
     except Exception:
         pass
     return None
