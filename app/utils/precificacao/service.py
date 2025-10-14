@@ -199,6 +199,7 @@ def construir_dataset_base(periodo_or_regiao, regiao: Union[Regiao, str, None] =
             "rebate_price_list": rebate_list,
             "logistic_type": a.get("logistic_type"),
             "is_full": bool((a.get("logistic_type") or "").lower() in {"fulfillment", "fulfillment_co"}),
+            "status": (a.get("status") or "").lower(), 
             "regiao": r,
         }
 
@@ -245,6 +246,27 @@ def enriquecer_preco_compra(documento: Dict[str, Any]) -> Dict[str, Any]:
     documento2["itens"] = it_out
     return documento2
 
+# --- aplica overrides.yaml aos itens do documento ---
+def aplicar_overrides_no_documento(documento: Dict[str, Any], cenario: str | None = None) -> Dict[str, Any]:
+    from app.utils.precificacao.overrides import resolver_override
+    it_out: List[Dict[str, Any]] = []
+    for it in (documento.get("itens") or []):
+        ov = resolver_override(
+            mlb=(it.get("mlb") or None),
+            sku=(it.get("sku") or None),
+            gtin=(it.get("gtin") or None),
+            cenario=cenario,
+        )
+        it2 = dict(it)
+        if ov and ov.knobs:
+            # derruba apenas chaves *_override; não mexe no resto
+            it2.update(ov.knobs)
+            # opcional: rastro de auditoria
+            it2.setdefault("_override_info", {"origem": ov.origem, "campanha_id": ov.campanha_id})
+        it_out.append(it2)
+    doc2 = dict(documento)
+    doc2["itens"] = it_out
+    return doc2
 
 def aplicar_metricas_no_documento(documento: Dict[str, Any], *, use_rebate_as_price: bool = True) -> Dict[str, Any]:
     itens_out = []
@@ -451,10 +473,13 @@ def executar(periodo: Periodo, regiao: Union[Regiao, str], *, use_rebate_as_pric
     """
     base = construir_dataset_base(periodo, regiao)
     com_custo = enriquecer_preco_compra(base)
-    com_metricas = aplicar_metricas_no_documento(com_custo, use_rebate_as_price=use_rebate_as_price)
-
-    # >>> NOVO: validação de insumos para MCP (gera avisos por item e em _meta.warnings)
+    # >>> NOVO: aplica overrides por MLB/SKU/GTIN/cenário
+    com_overrides = aplicar_overrides_no_documento(com_custo, cenario=None)
+    # calcula métricas já considerando overrides
+    com_metricas = aplicar_metricas_no_documento(com_overrides, use_rebate_as_price=use_rebate_as_price)
+    # validação
     validado = anexar_warnings_mcp(com_metricas)
+
 
     return salvar_documentos(validado, regiao, keep=keep, debug=debug)
 

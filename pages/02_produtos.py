@@ -1,4 +1,6 @@
-import os, subprocess, sys
+import os
+import subprocess
+import sys
 import streamlit as st
 from app.dashboard.produtos import render_dashboard_produtos
 from app.dashboard.produtos.context import make_context

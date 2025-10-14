@@ -32,7 +32,7 @@ cols = st.columns(3)
 with cols[0]:
     st.page_link("pages/03_replacement.py", label="🔁 Ir para Replacement", icon="↗")
 with cols[1]:
-    st.page_link("pages/04_precificacao.py", label="💸 Ir para Precificação", icon="↗")
+    st.page_link("pages/04_precificar.py", label="💸 Ir para Precificar", icon="↗")
 with cols[2]:
     st.page_link("pages/05_documentos_fiscais.py", label="📑 Ir para Documentos Fiscais", icon="↗")
 
@@ -44,7 +44,7 @@ with st.sidebar:
     st.page_link("pages/01_anuncios_meli.py", label="📣 Anúncios ML")
     st.page_link("pages/02_produtos.py", label="📦 Produtos")
     st.page_link("pages/03_replacement.py", label="🔁 Replacement")
-    st.page_link("pages/04_precificacao.py", label="💸 Precificação")
+    st.page_link("pages/04_precificar.py", label="💸 Precificar")
     st.page_link("pages/05_documentos_fiscais.py", label="📑 Documentos Fiscais")
 
 st.info(

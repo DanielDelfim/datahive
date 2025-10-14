@@ -1,0 +1,8 @@
+# C:\Apps\Datahive\app\utils\precificacao\regras\overrides.yaml
+por_item:
+  MLB4245349423:
+    custo_fixo_full_override: 6.5   # R$ por unidade (FULL)
+
+  "7908812400212":  # Cera De Abelha Pura 1kg    # GTIN como string
+    mcp_min_override: 0.15          # 20%
+    mcp_max_override: 0.30          # 40%

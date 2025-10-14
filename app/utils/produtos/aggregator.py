@@ -1,4 +1,4 @@
-# app/utils/produtos/agregador.py
+# C:\Apps\Datahive\app\utils\produtos\aggregator.py
 from __future__ import annotations
 
 from pathlib import Path
