@@ -1,204 +1,323 @@
+# app/utils/replacement/aggregator.py
 from __future__ import annotations
-from typing import Any, Iterable, Optional, Literal
+from typing import Any, Mapping, Sequence, Dict, List, Tuple, Optional
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
 
-from app.config.paths import Regiao
-from app.utils.replacement.config import DEFAULT_PARAMS
+# === Dependências do domínio ===
+from app.utils.anuncios.service import listar_anuncios_pp        # PP de anúncios (SP/MG)
+from app.utils.vendas.meli import service as vendas_srv          # Vendas agregadas por MLB
 from app.utils.replacement.metrics import estimate_30_60, estoque_pos_delay
 
-# VENDAS: SP/MG por MLB; BR por GTIN
-from app.utils.vendas.meli.service import get_por_mlb, get_por_gtin_br
+# DEFAULT_PARAMS (pesos, lead time etc.) — usa fallback seguro se não existir
+try:
+    from app.utils.replacement.config import DEFAULT_PARAMS
+except Exception:
+    class _DP:
+        weights = (0.5, 0.3, 0.2)  # w7/w15/w30
+        lead_time_days = 7
+    DEFAULT_PARAMS = _DP()  # type: ignore
 
-# ANÚNCIOS: estoque por MLB/GTIN
-from app.utils.anuncios.service import listar_anuncios_pp
 
-Loja = Literal["sp", "mg"]
+# ============================== Helpers básicos ==============================
 
-# ----------------- Helpers: unwrap/normalize -----------------
-def _unwrap_result(resp: Any) -> dict[str, dict]:
-    # {"result": {...}}
-    if isinstance(resp, Mapping) and "result" in resp and isinstance(resp["result"], Mapping):
-        return dict(resp["result"])
-    # {"per_gtin": {...}} / {"per_mlb": {...}} / {"data": {...}} / {"payload": {...}}
-    for k in ("per_gtin", "per_mlb", "data", "payload"):
-        if isinstance(resp, Mapping) and k in resp and isinstance(resp[k], Mapping):
-            return dict(resp[k])
-    # mapa direto {chave: row}
-    if isinstance(resp, Mapping):
-        return {str(k): (dict(v) if isinstance(v, Mapping) else v) for k, v in resp.items()}
-    # lista de linhas
-    if isinstance(resp, Sequence) and not isinstance(resp, (str, bytes)):
-        out: dict[str, dict] = {}
-        for item in resp:
-            if not isinstance(item, Mapping):
-                continue
-            key = (item.get("mlb") or item.get("gtin") or item.get("ean")
-                   or item.get("barcode") or item.get("key") or "").strip()
-            if key:
-                out[key] = dict(item)
-        if out:
-            return out
-    raise ValueError(f"Formato inesperado do service de vendas (amostra: {str(resp)[:300]})")
+def _norm_key(x: Any) -> str:
+    """Normaliza qualquer chave textual."""
+    return str(x or "").strip()
+
+def _norm_mlb(x: Any) -> str:
+    """Normaliza MLB (upper)."""
+    s = _norm_key(x)
+    return s.upper() if s else s
+
+def _to_num(x: Any, default: float = 0) -> float:
+    """Converte valores variados em número (int/float)."""
+    if x is None:
+        return default
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        try:
+            return float(x.replace(",", "."))
+        except Exception:
+            return default
+    if isinstance(x, dict):
+        # campos comuns
+        for k in ("qty", "quantity", "count", "value", "total", "sum", "qtd"):
+            if k in x and x[k] is not None:
+                return _to_num(x[k], default)
+        # mapa de janelas
+        for k in (7, "7", "w7", 15, "15", "w15", 30, "30", "w30"):
+            if k in x and x[k] is not None:
+                return _to_num(x[k], default)
+        return default
+    if isinstance(x, (list, tuple)) and x:
+        return _to_num(x[0], default)
+    return default
+
+
+# ========================= Leitura de janelas (7/15/30) ======================
 
 def _pick_window_from_any(row_like: Mapping, win: int | str) -> float:
-    """Retorna qty na janela 7/15/30, aceitando formatos aninhados e aliases."""
+    """
+    Lê quantidade vendida na janela (7/15/30) aceitando formatos:
+    - plano: vendas_7d, vendido_7d, sold_7, w7, qty_7, qtd_7, d7, last7...
+    - aninhado: windows/qty/qtd/sold/sum/totals/values (+ aliases acima)
+    """
     win = str(win)
     aliases = {
-        "7":  ["7","sold_7","qty_7","qtd_7","w7","7d","last_7","last7","d7"],
-        "15": ["15","sold_15","qty_15","qtd_15","w15","15d","last_15","last15","d15"],
-        "30": ["30","sold_30","qty_30","qtd_30","w30","30d","last_30","last30","d30"],
+        "7":  ["vendas_7d","vendido_7d","sold_7","qty_7","qtd_7","w7","7","d7","last7"],
+        "15": ["vendas_15d","vendido_15d","sold_15","qty_15","qtd_15","w15","15","d15","last15"],
+        "30": ["vendas_30d","vendido_30d","sold_30","qty_30","qtd_30","w30","30","d30","last30"],
     }[win]
 
     # plano
     for k in aliases:
         if k in row_like and row_like[k] is not None and not isinstance(row_like[k], Mapping):
-            try:
-                return float(row_like[k])
-            except Exception:
-                pass
+            return _to_num(row_like[k], 0)
 
     # aninhado
-    for nest in ("windows","qty","qtd","sold","sum","totals","values"):
+    for nest in ("windows", "qty", "qtd", "sold", "sum", "totals", "values"):
         v = row_like.get(nest)
         if not isinstance(v, Mapping):
             continue
         for k in aliases:
-            if k in v and isinstance(v[k], Mapping):
-                sub = v[k]
-                for leaf in ("qty_total","items_count","orders_count"):
-                    if leaf in sub and sub[leaf] is not None:
-                        try:
-                            return float(sub[leaf])
-                        except Exception:
-                            pass
-            elif k in v and v[k] is not None and not isinstance(v[k], Mapping):
-                try:
-                    return float(v[k])
-                except Exception:
-                    pass
-
-        # alguns retornos usam "w7"/"w15"/"w30"
+            if k in v and v[k] is not None:
+                vv = v[k]
+                if isinstance(vv, Mapping):
+                    for leaf in ("qty_total", "items_count", "orders_count", "sum", "total", "qty"):
+                        if leaf in vv and vv[leaf] is not None:
+                            return _to_num(vv[leaf], 0)
+                else:
+                    return _to_num(vv, 0)
+        # alternativo direto "w7"/"w15"/"w30"
         alt = f"w{win}"
-        if alt in v and isinstance(v[alt], Mapping):
-            sub = v[alt]
-            for leaf in ("qty_total","items_count","orders_count"):
-                if leaf in sub and sub[leaf] is not None:
-                    try:
-                        return float(sub[leaf])
-                    except Exception:
-                        pass
+        if alt in v and v[alt] is not None:
+            return _to_num(v[alt], 0)
+
     return 0.0
 
-def _normalize_row(row: Mapping) -> dict:
-    s7  = _pick_window_from_any(row, 7)
-    s15 = _pick_window_from_any(row, 15)
-    s30 = _pick_window_from_any(row, 30)
-    return {"sold_7": s7, "sold_15": s15, "sold_30": s30}
+def _sales_triplet(row_like: Mapping | None) -> Dict[str, int]:
+    """Extrai vendas 7/15/30 em int (retorna 0 se ausente)."""
+    if not isinstance(row_like, Mapping):
+        return {"vendas_7d": 0, "vendas_15d": 0, "vendas_30d": 0}
+    v7  = _pick_window_from_any(row_like, 7)
+    v15 = _pick_window_from_any(row_like, 15)
+    v30 = _pick_window_from_any(row_like, 30)
+    return {"vendas_7d": int(v7 or 0), "vendas_15d": int(v15 or 0), "vendas_30d": int(v30 or 0)}
 
-# ----------------- Estoque (anúncios) -----------------
-def _estoque_por_mlb_regiao(loja: Loja) -> dict[str, float]:
-    reg = Regiao.SP if loja == "sp" else Regiao.MG
-    acc: dict[str, float] = defaultdict(float)
-    for ad in listar_anuncios_pp(regiao=reg):
-        mlb = (ad.get("mlb") or ad.get("id") or "").strip()
+
+# ================== Desembrulho / índice de vendas por MLB ===================
+
+def _unwrap_result(resp: Any) -> Dict[str, dict]:
+    """
+    Tenta obter {key: row} a partir de múltiplos formatos:
+    - {"result": {...}} | {"result": {"per_mlb": {...}}} | {"per_mlb": {...}} | {"data": {...}} | {"payload": {...}}
+    - lista de registros com chaves mlb/id/item_id/sku/seller_sku/listing_id
+    """
+    if isinstance(resp, Mapping):
+        for top in ("result", "data", "payload"):
+            inner = resp.get(top)
+            if isinstance(inner, Mapping):
+                for leaf in ("per_mlb", "per_gtin"):
+                    dd = inner.get(leaf)
+                    if isinstance(dd, Mapping):
+                        return { _norm_key(k): (dict(v) if isinstance(v, Mapping) else {"value": v}) for k, v in dd.items() }
+                return { _norm_key(k): (dict(v) if isinstance(v, Mapping) else {"value": v}) for k, v in inner.items() }
+        for leaf in ("per_mlb", "per_gtin"):
+            dd = resp.get(leaf)
+            if isinstance(dd, Mapping):
+                return { _norm_key(k): (dict(v) if isinstance(v, Mapping) else {"value": v}) for k, v in dd.items() }
+        return { _norm_key(k): (dict(v) if isinstance(v, Mapping) else {"value": v}) for k, v in resp.items() }
+
+    if isinstance(resp, Sequence) and not isinstance(resp, (str, bytes)):
+        out: Dict[str, dict] = {}
+        for item in resp:
+            if not isinstance(item, Mapping):
+                continue
+            key = (
+                item.get("mlb") or item.get("id") or item.get("item_id") or
+                item.get("sku") or item.get("seller_sku") or item.get("listing_id") or ""
+            )
+            k = _norm_key(key)
+            if k:
+                out[k] = dict(item)
+        return out
+
+    return {}
+
+
+def _build_vendas_index_robusto(loja: str) -> Dict[str, dict]:
+    """
+    Retorna {MLB: registro_vendas}, casando por múltiplas chaves:
+    - vendas indexadas por mlb/id/item_id | sku/seller_sku/listing_id
+    - anúncios PP fornecem o dicionário de correspondência MLB -> {mlb, sku, seller_sku, listing_id}
+    """
+    # 1) vendas bruto
+    try:
+        raw = vendas_srv.get_por_mlb(loja, windows=(7, 15, 30), mode="qty")
+    except Exception:
+        raw = vendas_srv.get_por_mlb(loja)
+
+    vendas_map = _unwrap_result(raw)  # pode estar por mlb OU sku/etc.
+
+    # 2) index por todas as chaves possíveis
+    by_any: Dict[str, dict] = {}
+    for k, rec in vendas_map.items():
+        kk = _norm_key(k).upper()
+        by_any[kk] = rec
+        if isinstance(rec, Mapping):
+            for alt in ("mlb", "id", "item_id", "sku", "seller_sku", "listing_id"):
+                if alt in rec and rec[alt] is not None:
+                    by_any[_norm_key(rec[alt]).upper()] = rec
+
+    # 3) anuncios PP → dicionário de correspondência por MLB
+    ads = listar_anuncios_pp(regiao=loja) or []
+    cross: Dict[str, Tuple[str, ...]] = {}  # MLB -> possíveis chaves de vendas
+    for a in ads:
+        mlb = _norm_mlb(a.get("mlb") or a.get("id"))
         if not mlb:
             continue
-        raw = ad.get("estoque", ad.get("available_quantity", 0))
-        try:
-            acc[mlb] += float(raw or 0)
-        except Exception:
-            pass
-    return dict(acc)
+        candidates = {
+            mlb,
+            _norm_key(a.get("sku")).upper(),
+            _norm_key(a.get("seller_sku")).upper(),
+            _norm_key(a.get("listing_id")).upper(),
+        }
+        cross[mlb] = tuple(c for c in candidates if c)
 
-def _estoque_por_gtin_regiao(loja: Loja) -> dict[str, float]:
-    reg = Regiao.SP if loja == "sp" else Regiao.MG
-    acc: dict[str, float] = defaultdict(float)
-    for ad in listar_anuncios_pp(regiao=reg):
-        gtin = (ad.get("gtin") or ad.get("ean") or ad.get("barcode") or "").strip()
-        if not gtin:
+    # 4) monta índice final por MLB
+    out: Dict[str, dict] = {}
+    for mlb, cand_keys in cross.items():
+        rec = None
+        for k in cand_keys:
+            rec = by_any.get(k)
+            if rec:
+                break
+        rec = rec or by_any.get(mlb)
+        if rec:
+            out[mlb] = rec
+    return out
+
+
+# =========================== Mapa MLB → GTIN / título ========================
+
+def _map_mlb_to_gtin_title(loja: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, float]]:
+    """
+    Constrói:
+      - gtin_by_mlb: {MLB: GTIN}
+      - title_by_mlb: {MLB: title}
+      - estoque_by_mlb: {MLB: estoque_total_na_regiao}
+    a partir do PP de anúncios da região.
+    """
+    gtin_by_mlb: Dict[str, str] = {}
+    title_by_mlb: Dict[str, str] = {}
+    estoque_by_mlb: Dict[str, float] = defaultdict(float)
+
+    for ad in listar_anuncios_pp(regiao=loja) or []:
+        mlb = _norm_mlb(ad.get("mlb") or ad.get("id"))
+        if not mlb:
             continue
-        raw = ad.get("estoque", ad.get("available_quantity", 0))
+        gt = _norm_key(ad.get("gtin") or ad.get("ean") or ad.get("barcode"))
+        if gt:
+            gtin_by_mlb[mlb] = gt
+        title = ad.get("title") or ad.get("name") or ""
+        if title:
+            title_by_mlb[mlb] = title
+        est_raw = ad.get("estoque", ad.get("available_quantity", 0))
         try:
-            acc[gtin] += float(raw or 0)
+            estoque_by_mlb[mlb] += float(est_raw or 0)
         except Exception:
             pass
-    return dict(acc)
 
-def _estoque_por_gtin_br() -> dict[str, float]:
-    acc: dict[str, float] = defaultdict(float)
-    for loja in ("sp", "mg"):
-        for k, v in _estoque_por_gtin_regiao(loja).items():
-            acc[k] += float(v or 0)
-    return dict(acc)
+    return gtin_by_mlb, title_by_mlb, dict(estoque_by_mlb)
 
-# ----------------- MLB→GTIN (para enriquecer detalhe) -----------------
-def _map_mlb_to_gtin(loja: Loja) -> dict[str, str]:
-    reg = Regiao.SP if loja == "sp" else Regiao.MG
-    m: dict[str, str] = {}
-    for ad in listar_anuncios_pp(regiao=reg):
-        mlb = (ad.get("mlb") or ad.get("id") or "").strip()
-        gtin = (ad.get("gtin") or ad.get("ean") or ad.get("barcode") or "").strip()
-        if mlb and gtin:
-            m[mlb] = gtin
-    return m
 
-# ----------------- Projeções: SP/MG por MLB -----------------
-def _map_estimativas_mlb(por_mlb: dict[str, dict], *, estoque_map: Optional[dict[str, float]] = None) -> dict[str, dict]:
-    out: dict[str, dict] = {}
-    for mlb, payload in por_mlb.items():
-        base = _normalize_row(payload)
-        est  = estimate_30_60(base["sold_7"], base["sold_15"], base["sold_30"], DEFAULT_PARAMS.weights)
-        estoque_atual = None if estoque_map is None else estoque_map.get(mlb)
-        pos_delay = estoque_pos_delay(estoque_atual, est["taxa_diaria"], DEFAULT_PARAMS.lead_time_days)
-        title = payload.get("title") if isinstance(payload, Mapping) else None
-        out[mlb] = {
-            "mlb": mlb,
-            "title": title,
-            **base,
-            **est,
-            "consumo_previsto_7d_lead": est["taxa_diaria"] * DEFAULT_PARAMS.lead_time_days,
-            "estoque_atual": estoque_atual,
-            "estoque_pos_delay_7": pos_delay,
-        }
+# ======================= Linha final (estima/estoque/etc.) ====================
+
+def _compose_row(mlb: str, base: dict, vendas_rec: Optional[dict],
+                 gtin_by_mlb: Dict[str, str],
+                 title_by_mlb: Dict[str, str],
+                 estoque_by_mlb: Dict[str, float]) -> dict:
+    """
+    Monta uma linha enriquecida por MLB com:
+      mlb, title, gtin, vendas_7/15/30, taxa_diaria, estimado_30/60,
+      consumo_previsto_7d_lead, estoque_atual, estoque_pos_delay_7, replacement_30/60 (quando houver).
+    """
+    row: dict = dict(base or {})
+    row["mlb"] = mlb
+    row["title"] = row.get("title") or title_by_mlb.get(mlb) or ""
+    row["gtin"] = row.get("gtin") or gtin_by_mlb.get(mlb)
+
+    # vendas
+    sales = _sales_triplet(vendas_rec)
+    row.update(sales)
+
+    # estimativas a partir das vendas (padrão do domínio)
+    est = estimate_30_60(sales["vendas_7d"], sales["vendas_15d"], sales["vendas_30d"], DEFAULT_PARAMS.weights)
+    row.update(est)
+
+    # consumo previsto durante lead time (ex.: 7 dias)
+    row["consumo_previsto_7d_lead"] = est["taxa_diaria"] * DEFAULT_PARAMS.lead_time_days
+
+    # estoque atual por MLB (somado na região)
+    estoque_atual = estoque_by_mlb.get(mlb)
+    row["estoque_atual"] = estoque_atual
+
+    # estoque após delay (lead time)
+    row["estoque_pos_delay_7"] = estoque_pos_delay(estoque_atual, est["taxa_diaria"], DEFAULT_PARAMS.lead_time_days)
+
+    # se já existirem replacement_30/60 no base, preserva; caso contrário ficam implícitos por estimado_30/60
+    # (não forçamos aqui para manter separação semântica)
+    return row
+
+
+# =============================== Funções públicas =============================
+
+def montar_anuncios_por_mlb_enriquecido(regiao: str) -> List[Dict[str, Any]]:
+    """
+    Enriquece dados por MLB na região informada (sp|mg):
+      - Join robusto entre VENDAS (por MLB) e ANÚNCIOS (PP) por múltiplas chaves
+      - Injeta GTIN/title/estoque
+      - Calcula vendas 7/15/30, taxa_diaria, estimado_30/60, consumo_previsto_7d_lead, estoque_pos_delay_7
+    Retorna lista ordenada de linhas (determinística).
+    """
+    loja = (_norm_key(regiao) or "").lower()
+    if loja not in ("sp", "mg"):
+        raise ValueError("regiao inválida: use 'sp' ou 'mg'.")
+
+    # mapas a partir do PP de anúncios
+    gtin_by_mlb, title_by_mlb, estoque_by_mlb = _map_mlb_to_gtin_title(loja)
+
+    # índice de vendas robusto (casando mlb/id/item_id/sku/seller_sku/listing_id)
+    vendas_index = _build_vendas_index_robusto(loja)
+
+    # universo de MLBs = o que existe no PP de anúncios (garante consistência)
+    mlbs = sorted(gtin_by_mlb.keys() | title_by_mlb.keys() | estoque_by_mlb.keys())
+
+    out: List[Dict[str, Any]] = []
+    for mlb in mlbs:
+        rec_v = vendas_index.get(mlb)
+        linha = _compose_row(mlb, {}, rec_v, gtin_by_mlb, title_by_mlb, estoque_by_mlb)
+        linha["regiao"] = loja
+        out.append(linha)
+
+    # ordenação determinística (por estimado_30 desc, title asc, mlb asc)
+    out.sort(key=lambda r: (-float(r.get("estimado_30") or 0), r.get("title") or "", r.get("mlb") or ""))
+
     return out
 
-def carregar_por_mlb_regiao(loja: Loja, windows: Iterable[int] = (7, 15, 30)) -> dict[str, dict]:
-    reg = Regiao.SP if loja == "sp" else Regiao.MG
-    resp = get_por_mlb(reg, windows=windows, mode="qty")
-    data = _unwrap_result(resp)
-    estoque_map = _estoque_por_mlb_regiao(loja)
-    return _map_estimativas_mlb(data, estoque_map=estoque_map)
+def carregar_por_mlb_regiao(regiao: str) -> dict[str, dict]:
+    """
+    BACKCOMPAT:
+      Antes: esta função existia e era importada pela page/service.
+      Agora: delegamos para `montar_anuncios_por_mlb_enriquecido(regiao)` e
+      retornamos no formato {mlb: row} para não quebrar quem esperava dict.
+    """
+    rows = montar_anuncios_por_mlb_enriquecido(regiao)
+    return {str(r.get("mlb") or "").upper(): r for r in rows}
 
-# ----------------- Projeções: BR (SP+MG) por GTIN -----------------
-def _map_estimativas_gtin(por_gtin: dict[str, dict], *, estoque_map: Optional[dict[str, float]] = None) -> dict[str, dict]:
-    out: dict[str, dict] = {}
-    for gtin, payload in por_gtin.items():
-        base = _normalize_row(payload)
-        est  = estimate_30_60(base["sold_7"], base["sold_15"], base["sold_30"], DEFAULT_PARAMS.weights)
-        estoque_atual = None if estoque_map is None else estoque_map.get(gtin)
-        pos_delay = estoque_pos_delay(estoque_atual, est["taxa_diaria"], DEFAULT_PARAMS.lead_time_days)
-        title = payload.get("title") if isinstance(payload, Mapping) else None
-        out[gtin] = {
-            "gtin": gtin,
-            "title": title,
-            **base,
-            **est,
-            "consumo_previsto_7d_lead": est["taxa_diaria"] * DEFAULT_PARAMS.lead_time_days,
-            "estoque_atual": estoque_atual,
-            "estoque_pos_delay_7": pos_delay,
-        }
-    return out
-
-def carregar_por_gtin_br(windows: Iterable[int] = (7, 15, 30)) -> dict[str, dict]:
-    resp = get_por_gtin_br(windows=windows, mode="qty")
-    data = _unwrap_result(resp)
-    estoque_map = _estoque_por_gtin_br()
-    return _map_estimativas_gtin(data, estoque_map=estoque_map)
-
-# ----------------- Exports internos úteis ao service -----------------
 __all__ = [
-    "carregar_por_mlb_regiao",
-    "carregar_por_gtin_br",
-    "_map_mlb_to_gtin",
+    "montar_anuncios_por_mlb_enriquecido",
+    "carregar_por_mlb_regiao",  # backcompat
 ]
+
