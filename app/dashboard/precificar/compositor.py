@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from typing import List
 import streamlit as st
+from app.utils.anuncios.service import obter_anuncio_por_mlb_pp  # estoque por MLB/região (PP)
+
+from app.utils.vendas.meli.service import get_por_mlb, get_por_mlb_br
 
 from app.config.paths import Regiao
 from app.utils.precificacao.service import (
@@ -14,6 +17,9 @@ from app.utils.precificacao.service import (
 from app.utils.precificacao.simulator import simular_mcp_item
 from app.utils.precificacao.precos_min_max import precos_min_max
 from app.utils.precificacao.metrics import carregar_regras_ml
+
+from app.utils.precificacao.metrics_estoque import calcular_cobertura_estoque
+
 
 def _dataset_memoria_unit(regiao: Regiao) -> dict:
     # versão unitária (sem mudanças nas suas regras)
@@ -197,6 +203,169 @@ def _simulador(item: dict):
         with st.expander("Decomposição completa"):
             st.json(res, expanded=False)
 
+def _norm_windows(payload: dict) -> dict:
+    """
+    Aceita o dicionário retornado por get_resumos(...) e tenta extrair contagens
+    das janelas 7/15/30, tolerando variações de shape.
+    Retorna um dict padronizado: {"w7": int, "w15": int, "w30": int}
+    """
+    if not isinstance(payload, dict):
+        return {"w7": 0, "w15": 0, "w30": 0}
+
+    data = payload.get("result", payload)
+
+    def _take(x):
+        if isinstance(x, dict):
+            for k in ("qtd", "count", "total", "value", "sum"):
+                if k in x and isinstance(x[k], (int, float)):
+                    return int(x[k])
+            # último recurso: tenta converter diretamente
+            try:
+                return int(x.get("qty") or 0)
+            except Exception:
+                return 0
+        try:
+            return int(x)
+        except Exception:
+            return 0
+
+    # tenta várias chaves usuais
+    w7  = _take(data.get("w7",  data.get("7",  0)))
+    w15 = _take(data.get("w15", data.get("15", 0)))
+    w30 = _take(data.get("w30", data.get("30", 0)))
+
+    # fallback: quando as chaves vêm como strings variadas
+    if (w7, w15, w30) == (0, 0, 0):
+        acc = {}
+        for k, v in (data.items() if isinstance(data, dict) else []):
+            ks = str(k).lower().replace("days", "").replace("day", "").replace(" ", "")
+            ks = ks.replace("janela", "").replace("window", "").replace("w", "")
+            try:
+                d = int(ks)
+                if d in (7, 15, 30):
+                    acc[f"w{d}"] = _take(v)
+            except Exception:
+                pass
+        w7, w15, w30 = acc.get("w7", 0), acc.get("w15", 0), acc.get("w30", 0)
+
+    return {"w7": w7, "w15": w15, "w30": w30}
+
+
+def _coletar_vendas_mlb_por_janelas(mlb: str, reg_label: str) -> dict:
+    """
+    Lê o agregado do service de vendas no mesmo formato do dashboard de vendas.
+    Retorna {"w7": int, "w15": int, "w30": int} para o MLB selecionado.
+    """
+    mlb = (mlb or "").strip()
+    if not mlb:
+        return {"w7": 0, "w15": 0, "w30": 0}
+
+    # escolhe a fonte conforme Região na UI
+    if reg_label.strip().upper().startswith("SP"):
+        agg = get_por_mlb("sp", windows=(7, 15, 30))
+    elif reg_label.strip().upper().startswith("MG"):
+        agg = get_por_mlb("mg", windows=(7, 15, 30))
+    else:
+        # SP + MG (Brasil)
+        agg = get_por_mlb_br(windows=(7, 15, 30))
+
+    payload = (agg or {}).get(mlb, {})
+    windows = payload.get("windows", {})
+
+    def _q(win: int) -> int:
+        w = windows.get(str(win)) or {}
+        try:
+            return int(w.get("qty_total") or 0)
+        except Exception:
+            return 0
+
+    return {"w7": _q(7), "w15": _q(15), "w30": _q(30)}
+
+def _render_secao_vendas_mlb(mlb: str, reg_label: str):
+    st.markdown("---")
+    st.subheader("Vendas do anúncio (MLB) nos últimos 7/15/30 dias")
+
+    win = _coletar_vendas_mlb_por_janelas(mlb, reg_label)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("7 dias",  f"{win['w7']}")
+    c2.metric("15 dias", f"{win['w15']}")
+    c3.metric("30 dias", f"{win['w30']}")
+
+def _lojas_from_reg_label(reg_label: str) -> list[str]:
+    s = (reg_label or "").strip().upper()
+    if s.startswith("SP"):
+        return ["sp"]
+    if s.startswith("MG"):
+        return ["mg"]
+    # "SP + MG" ou qualquer visão Brasil
+    return ["sp", "mg"]
+
+
+def _coletar_estoque_por_mlb(mlb: str, reg_label: str) -> dict:
+    """
+    Lê o estoque (PP) do anúncio por MLB para as lojas derivadas da região da UI.
+    Retorno:
+      {
+        "por_loja": {"sp": float|int, "mg": float|int},
+        "total": float|int
+      }
+    """
+    mlb = (mlb or "").strip()
+    if not mlb:
+        return {"por_loja": {}, "total": 0}
+
+    por_loja = {}
+    for loja in _lojas_from_reg_label(reg_label):
+        try:
+            rec = obter_anuncio_por_mlb_pp(loja, mlb)  # retorna dict PP ou None
+            est = rec.get("estoque") if isinstance(rec, dict) else 0
+            # normaliza para número
+            try:
+                est = float(est) if est is not None else 0.0
+            except Exception:
+                est = 0.0
+            por_loja[loja] = est
+        except Exception:
+            por_loja[loja] = 0.0
+
+    total = sum(por_loja.values()) if por_loja else 0.0
+    return {"por_loja": por_loja, "total": total}
+
+
+def _render_secao_estoque_mlb(mlb: str, reg_label: str):
+    st.markdown("---")
+    st.subheader("Estoque do anúncio no Mercado Livre (PP)")
+
+    info = _coletar_estoque_por_mlb(mlb, reg_label)
+    sp = info["por_loja"].get("sp", 0)
+    mg = info["por_loja"].get("mg", 0)
+    total = info["total"]
+
+    lojas = _lojas_from_reg_label(reg_label)
+    if lojas == ["sp"]:
+        st.metric("Estoque (SP)", f"{int(sp) if float(sp).is_integer() else sp}")
+    elif lojas == ["mg"]:
+        st.metric("Estoque (MG)", f"{int(mg) if float(mg).is_integer() else mg}")
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("SP", f"{int(sp) if float(sp).is_integer() else sp}")
+        c2.metric("MG", f"{int(mg) if float(mg).is_integer() else mg}")
+        c3.metric("Total SP+MG", f"{int(total) if float(total).is_integer() else total}")
+
+    # === NOVO: card de cobertura 40/35/25 ===
+    # Lê janelas no mesmo formato do dashboard de vendas
+    if lojas == ["sp"]:
+        agg = get_por_mlb("sp", windows=(7, 15, 30))
+    elif lojas == ["mg"]:
+        agg = get_por_mlb("mg", windows=(7, 15, 30))
+    else:
+        agg = get_por_mlb_br(windows=(7, 15, 30))
+
+    windows = (agg or {}).get(mlb, {}).get("windows", {})
+
+    cov = calcular_cobertura_estoque(total, windows)
+    st.metric("Cobertura estimada (40/35/25)", cov["dias_cobertura_str"],
+              help=f"Consumo/dia (pond.): {cov['consumo_dia_pond']:.2f}")
 
 def render():
     st.title("Precificação — Dashboard")
@@ -266,9 +435,10 @@ def render():
             _tabela_mesmo_gtin(itens_universo, gtin=gtin)
             _simulador(item)
             _render_cards_metricas(item)
-    else:
-        st.info("Marque pelo menos uma linha na tabela acima para ver os anúncios com o mesmo GTIN e usar o simulador.")
-
+            _render_secao_vendas_mlb(item.get("mlb") or "", reg_label)
+            _render_secao_estoque_mlb(item.get("mlb") or "", reg_label)
+        else:
+            st.info("Marque pelo menos uma linha ...")
 def _render_cards_metricas(item: dict):
     st.markdown("### Métricas & Preços-alvo")
 
