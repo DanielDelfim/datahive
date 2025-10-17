@@ -1,3 +1,4 @@
+# app/dashboard/produtos/abas/catalogo.py
 from __future__ import annotations
 import json
 import pandas as pd

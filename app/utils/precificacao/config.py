@@ -12,6 +12,7 @@ REGRAS_DIR = Path("app") / "utils" / "precificacao" / "regras"
 REGRAS_ML_YAML = REGRAS_DIR / "mercado_livre.yaml"
 REGRAS_OVERRIDES_YAML = REGRAS_DIR / "overrides.yaml"
 
+
 def get_overrides_yaml_path() -> Path:
     return REGRAS_OVERRIDES_YAML
 

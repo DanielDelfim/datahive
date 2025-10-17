@@ -1,0 +1,16 @@
+#C:\Apps\Datahive\app\utils\precificacao\regras\site_woocomerce.yaml
+# Regras de precificação — Canal: Site (WooCommerce)
+canal: site
+gateway_pagamento: mercado_pago
+
+default:
+  imposto_pct: 0.10
+  marketing_pct: 0.07
+  frete_pct_sobre_custo: 0.05
+  mcp_min: 0.10
+  mcp_max: 0.25
+  mercado_pago_pct: 0.04   # 4% (use ponto, não vírgula)
+
+overrides:
+  por_item: {}
+  por_categoria: {}

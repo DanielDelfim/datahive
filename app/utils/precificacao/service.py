@@ -26,13 +26,13 @@ from app.utils.precificacao.config import (
     get_regras_meli_yaml_path,
 )
 
+from app.utils.precificacao.metrics import (
+    calcular_metricas_item, agregar_metricas_documento,
+)
+
 # Services adjacentes
 from app.utils.anuncios.service import listar_anuncios_pp, validar_integridade_pp
 from app.utils.produtos.service import get_indices as get_indices_produtos
-
-# Métricas/cálculos puros
-from app.utils.precificacao.metrics import calcular_metricas_item, agregar_metricas_documento
-
 
 # ==== Result Sink (tolerante a layout) ====
 JsonFileSink = StdoutSink = MultiSink = None  # type: ignore
@@ -268,13 +268,25 @@ def aplicar_overrides_no_documento(documento: Dict[str, Any], cenario: str | Non
     doc2["itens"] = it_out
     return doc2
 
-def aplicar_metricas_no_documento(documento: Dict[str, Any], *, use_rebate_as_price: bool = True) -> Dict[str, Any]:
+def aplicar_metricas_no_documento(
+    documento: Dict[str, Any], *,
+    regras: dict | None = None,
+    only_full: bool = False,
+    use_rebate_as_price: bool = True,
+    canal: str = "meli",
+) -> Dict[str, Any]:
+    itens_in = documento.get("itens", []) or []
+
     itens_out = []
-    for it in documento["itens"]:
-        calc = calcular_metricas_item(it, use_rebate_as_price=use_rebate_as_price)
+    for it in itens_in:
+        if only_full and not is_item_full(it):
+            itens_out.append(dict(it))
+            continue
+
+        calc = calcular_metricas_item(it, regras=regras, use_rebate_as_price=use_rebate_as_price)
         merged = dict(it)
         merged.update(calc)
-        itens_out.append(merged)
+        itens_out.append(merged) 
 
     doc2 = dict(documento)
     doc2["itens"] = itens_out
@@ -371,7 +383,7 @@ def _build_meta(documento: Dict[str, Any], *, source_paths: List[str]) -> Dict[s
     h = _hash_payload_ordered(documento["itens"])
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "stage": Camada.PP.value,
+        "stage": Stage.DEV.value,
         "marketplace": Marketplace.MELI.value,
         "regiao": documento.get("regiao"),
         "camada": Camada.PP.value,
@@ -459,11 +471,9 @@ def salvar_dataset(documento: Dict[str, Any], regiao: Union[Regiao, str], *, kee
 
     return out_json
 
-
 # =========================
 # Orquestração do módulo
 # =========================
-
 def executar(periodo: Periodo, regiao: Union[Regiao, str], *, use_rebate_as_price: bool = True, keep: int = 7, debug: bool = False) -> Tuple[str, str]:
     """
     1) carrega anúncios (PP) → documento base

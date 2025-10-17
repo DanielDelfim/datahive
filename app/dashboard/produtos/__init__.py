@@ -1,10 +1,8 @@
 # app/dashboard/produtos/__init__.py
-import streamlit as st
-from .abas import resumo, catalogo
+from __future__ import annotations
+from typing import Any
 
-def render_dashboard_produtos(ctx) -> None:
-    tabs = st.tabs(["📊 Resumo", "📚 Catálogo"])
-    with tabs[0]:
-        resumo.render(ctx)
-    with tabs[1]:
-        catalogo.render(ctx)
+def render_dashboard_produtos(ctx: Any) -> None:
+    # Import tardio para evitar ciclo
+    from . import compositor
+    compositor.render(ctx)

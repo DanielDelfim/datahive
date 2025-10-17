@@ -9,6 +9,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
 
+from pathlib import Path as _Path
+
 # ----------------------------- util internos -----------------------------
 def _expand_path(p: str | os.PathLike | None) -> Optional[Path]:
     if p is None:
@@ -226,3 +228,24 @@ def anuncios_log_dir() -> Path:
 
 def vendas_log_dir() -> Path:
     return ensure_dir(LOGS_DIR / "meli" / "vendas")
+# ----------------
+
+
+@dataclass(frozen=True)
+class Paths:
+    """Adaptador p/ compatibilidade: fornece roots usados nos módulos."""
+    @staticmethod
+    def base_root() -> _Path:
+        return BASE_PATH
+
+    @staticmethod
+    def data_root() -> _Path:
+        return DATA_DIR
+
+    @staticmethod
+    def tokens_root() -> _Path:
+        return TOKENS_DIR
+
+    @staticmethod
+    def logs_root() -> _Path:
+        return LOGS_DIR

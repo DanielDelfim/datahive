@@ -455,33 +455,36 @@ def _render_cards_metricas(item: dict):
         except Exception:
             return "—"
 
+    # helper: valor do frete ao cliente (override > item)
+    def _frete_cliente(it: dict):
+        v = it.get("frete_full_override")
+        if v is None:
+            v = it.get("frete_full")
+        return v
+
     pe   = item.get("preco_efetivo") or item.get("rebate_price_discounted") or item.get("price")
     pmin = item.get("preco_min") or item.get("preco_minimo")
     pmax = item.get("preco_max") or item.get("preco_maximo")
 
+    # linha 1
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Preço atual (R$)", m(pe))
-    c2.metric("MCP (R$ / %)",
-              f"{m(item.get('mcp_abs'))}",
-              pct(item.get('mcp_pct')))
-    c3.metric("Comissão ML (R$ / %)",
-              f"{m(item.get('comissao'))}",
-              pct(item.get('comissao_pct')))
+    c2.metric("MCP (R$ / %)", f"{m(item.get('mcp_abs'))}", pct(item.get('mcp_pct')))
+    c3.metric("Comissão ML (R$ / %)", f"{m(item.get('comissao'))}", pct(item.get('comissao_pct')))
     c4.metric("Custo fixo ML (R$)", m(item.get("custo_fixo_full")))
 
+    # linha 2
     c5, c6, c7, c8 = st.columns(4)
     faixa = (m(pmin) if pmin is not None else "—") + "  →  " + (m(pmax) if pmax is not None else "—")
     c5.metric("Faixa alvo (min → máx)", faixa)
     c6.metric("Preço de custo (R$)", m(item.get("preco_compra")))
-    c7.metric("Imposto (R$ / %)",
-              f"{m(item.get('imposto'))}",
-              pct(item.get('imposto_pct')))
-    c8.metric("Marketing (R$ / %)",
-              f"{m(item.get('marketing'))}",
-              pct(item.get('marketing_pct')))
+    c7.metric("Imposto (R$ / %)", f"{m(item.get('imposto'))}", pct(item.get('imposto_pct')))
+    c8.metric("Marketing (R$ / %)", f"{m(item.get('marketing'))}", pct(item.get('marketing_pct')))
 
-    c9, c10, c11, c12 = st.columns(4)
-    c9.metric("Frete (R$)", m(item.get("frete_sobre_custo") or item.get("frete_full")))
-    c10.metric("Subsídio ML (R$ / taxa)", m(item.get("subsidio_ml_valor")), pct(item.get("subsidio_ml_taxa")))
-    c11.metric("Logística", (item.get("logistic_type") or "—").upper())
-    c12.metric("GTIN / MLB", f"{item.get('gtin') or '—'} / {item.get('mlb') or '—'}")
+    # linha 3 — separa os dois fretes
+    c9, c10, c11, c12, c13 = st.columns(5)
+    c9.metric("Frete (R$)", m(item.get("frete_sobre_custo")))  # frete de envio/transferência
+    c10.metric("Frete ao cliente (R$)", m(_frete_cliente(item)))  # frete grátis do ML
+    c11.metric("Subsídio ML (R$ / taxa)", m(item.get("subsidio_ml_valor")), pct(item.get("subsidio_ml_taxa")))
+    c12.metric("Logística", (item.get("logistic_type") or "—").upper())
+    c13.metric("GTIN / MLB", f"{item.get('gtin') or '—'} / {item.get('mlb') or '—'}")

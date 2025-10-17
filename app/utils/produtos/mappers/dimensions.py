@@ -70,37 +70,87 @@ def _flatten_1level(rec: Mapping[str, Any]) -> dict[str, Any]:
 
 def normalize_peso_dimensoes(rec: Mapping[str, Any]) -> dict[str, Any]:
     """
-    Retorna dict com:
-      peso (kg), altura (cm), largura (cm), profundidade (cm)
-    Suporta seu PP: pesos_g.{bruto, liq} e dimensoes_cm.{altura, largura, profundidade}
-    + aliases comuns (ML, etc.).
+    PRODUTO: Retorna dict com
+      peso (kg), altura (cm), largura (cm), profundidade (cm).
+    Lê pesos_g.{bruto,liq} e dimensoes_cm.{altura,largura,profundidade} + aliases.
     """
     flat = _flatten_1level(rec)
-
     peso_raw = _coalesce(flat, [
-        "pesos_g.bruto", "pesos_g.liq",      # seu PP
+        "pesos_g.bruto", "pesos_g.liq",
         "package_weight_g", "package.weight", "shipping_weight", "weight_g",
         "peso", "weight", "peso_bruto", "peso_liq"
     ])
     altura_raw = _coalesce(flat, [
-        "dimensoes_cm.altura",               # seu PP
+        "dimensoes_cm.altura",
         "package_height", "shipping_height", "height", "altura", "altura_cm",
         "dimensions.height", "package.height", "shipping.height"
     ])
     largura_raw = _coalesce(flat, [
-        "dimensoes_cm.largura",              # seu PP
+        "dimensoes_cm.largura",
         "package_width", "shipping_width", "width", "largura", "largura_cm",
         "dimensions.width", "package.width", "shipping.width"
     ])
     profundidade_raw = _coalesce(flat, [
-        "dimensoes_cm.profundidade",         # seu PP
+        "dimensoes_cm.profundidade",
         "package_length", "shipping_length", "length", "profundidade", "comprimento",
         "dimensions.length", "package.length", "shipping.length"
     ])
-
     return {
         "peso": _parse_num_with_unit(peso_raw, kind="weight"),
         "altura": _parse_num_with_unit(altura_raw, kind="length"),
         "largura": _parse_num_with_unit(largura_raw, kind="length"),
         "profundidade": _parse_num_with_unit(profundidade_raw, kind="length"),
     }
+
+def normalize_peso_dimensoes_caixa(rec: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    CAIXA: Retorna dict com
+      peso_caixa (kg), caixa_altura (cm), caixa_largura (cm), caixa_profundidade (cm).
+    Lê pesos_caixa_g.bruto e caixa_cm.{altura,largura,profundidade} + alguns aliases.
+    Não faz fallback para os campos do produto.
+    """
+    flat = _flatten_1level(rec)
+    peso_raw = _coalesce(flat, [
+        "pesos_caixa_g.bruto",  # seu PP de caixa (g)
+        "box_weight_g", "box.weight_g", "outer_pack.weight_g",
+    ])
+    altura_raw = _coalesce(flat, [
+        "caixa_cm.altura",      # seu PP de caixa (cm)
+        "box_height", "outer_pack.height_cm", "box.height",
+    ])
+    largura_raw = _coalesce(flat, [
+        "caixa_cm.largura",
+        "box_width", "outer_pack.width_cm", "box.width",
+    ])
+    profundidade_raw = _coalesce(flat, [
+        "caixa_cm.profundidade",
+        "box_length", "outer_pack.length_cm", "box.length",
+    ])
+    return {
+        "peso_caixa": _parse_num_with_unit(peso_raw, kind="weight"),
+        "caixa_altura": _parse_num_with_unit(altura_raw, kind="length"),
+        "caixa_largura": _parse_num_with_unit(largura_raw, kind="length"),
+        "caixa_profundidade": _parse_num_with_unit(profundidade_raw, kind="length"),
+    }
+
+def attach_dims_blocks(rec: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Retorna um dict unificado com os dois blocos:
+      - produto_*  (peso/altura/largura/profundidade)
+      - caixa_*    (peso_caixa/caixa_altura/caixa_largura/caixa_profundidade)
+    Não aplica fallback entre blocos; cada um usa sua própria fonte.
+    """
+    prod = normalize_peso_dimensoes(rec)
+    box  = normalize_peso_dimensoes_caixa(rec)
+    out = {
+        "produto_peso": prod["peso"],
+        "produto_altura": prod["altura"],
+        "produto_largura": prod["largura"],
+        "produto_profundidade": prod["profundidade"],
+        "peso_caixa": box["peso_caixa"],
+        "caixa_altura": box["caixa_altura"],
+        "caixa_largura": box["caixa_largura"],
+        "caixa_profundidade": box["caixa_profundidade"],
+    }
+    return out
+

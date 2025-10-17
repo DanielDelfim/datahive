@@ -1,0 +1,12 @@
+#C:\Apps\Datahive\app\utils\precificar_woo\regras\site_woocommerce.yaml
+canal: site
+gateway_pagamento: mercado_pago
+default:
+  imposto_pct: 0.10
+  marketing_pct: 0.00
+  frete_pct_sobre_custo: 0.05
+  mcp_min: 0.10
+  mcp_max: 0.25
+  mercado_pago_pct: 0.00
+overrides:
+  por_item: {}

@@ -6,3 +6,17 @@ por_item:
   "7908812400212":  # Cera De Abelha Pura 1kg    # GTIN como string
     mcp_min_override: 0.15          # 20%
     mcp_max_override: 0.30          # 40%
+
+  MLB5454228750: # pinati brigadeiro
+    custo_fixo_full_override: 6.5 
+
+  "7898962720875": # Pinati cups amendoim 
+    custo_fixo_full_override: 0
+    frete_full_override: 20.20
+
+  "7898962720752": # Pinati choc belga
+    custo_fixo_full_override: 6.5
+
+  "7898962720776": # Pinati pistache
+    custo_fixo_full_override: 6.5
+

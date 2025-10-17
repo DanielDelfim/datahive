@@ -4,7 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
+from app.utils.produtos.mappers.dimensions import attach_dims_blocks
 import pandas as pd
+from app.utils.produtos.metrics import normalizar_multiplo
 
 from app.utils.core.produtos.units import (
     to_bool, to_int, to_float, calc_volume_m3,
@@ -16,6 +18,52 @@ from app.utils.produtos.config import (
     REGIME_FISCAL, REQUIRED_MIN
 )
 
+def _safe_get(d: Dict[str, Any] | None, *path):
+    x = d or {}
+    for p in path:
+        x = x.get(p) if isinstance(x, dict) else None
+    return x
+
+def normalizar_para_envio(prod: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Padroniza um produto para a aba **Envios** SEM fallback:
+      - CAIXA: caixa_cm.{largura, profundidade, altura} (cm)
+      - CAIXA: pesos_caixa_g.bruto (g)  [convertido de kg -> g]
+      - multiplo_compra normalizado (>=1) ou None
+      - ean/gtin/titulo/preco_compra canônicos
+    Também retorna os campos do PRODUTO (dimensoes_cm/pesos_g) apenas para referência.
+   """
+
+    dims = attach_dims_blocks(prod)
+
+    return {
+        "titulo": prod.get("titulo") or prod.get("title") or "",
+        "gtin": prod.get("gtin") or prod.get("ean") or "",
+        "ean": prod.get("ean") or prod.get("gtin") or "",
+        "multiplo_compra": normalizar_multiplo(
+            prod.get("multiplo_compra") or prod.get("multiplo_de_compra") or prod.get("multiplo")
+        ),
+        "preco_compra": prod.get("preco_compra") if isinstance(prod.get("preco_compra"), (int, float)) else prod.get("custo"),
+        # bloco CAIXA (sem fallback):
+        "caixa_cm": {
+            "largura": dims["caixa_largura"],
+            "profundidade": dims["caixa_profundidade"],
+            "altura": dims["caixa_altura"],
+        },
+        "pesos_caixa_g": {
+            # mapper retorna kg; se quiser em g, multiplique por 1000 caso não seja None
+            "bruto": None if dims["peso_caixa"] is None else round(dims["peso_caixa"] * 1000, 3),
+        },
+        # (opcional) manter também os campos de PRODUTO, se forem úteis em outras abas:
+        "dimensoes_cm": {
+            "largura": dims["produto_largura"],
+            "profundidade": dims["produto_profundidade"],
+            "altura": dims["produto_altura"],
+        },
+        "pesos_g": {
+            "bruto": None if dims["produto_peso"] is None else round(dims["produto_peso"] * 1000, 3),
+        },
+    }
 
 def _s(df_value) -> str | None:
     if df_value is None:
@@ -27,7 +75,6 @@ def _s(df_value) -> str | None:
         pass
     s = str(df_value).strip()
     return s or None
-
 
 def _normalize_row(row: dict) -> dict:
     # Identificadores

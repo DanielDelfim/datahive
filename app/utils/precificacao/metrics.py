@@ -6,7 +6,6 @@ import yaml
 
 from app.utils.precificacao.config import get_regras_meli_yaml_path
 
-
 # =========================
 # Utilidades numéricas
 # =========================
@@ -60,7 +59,6 @@ def carregar_regras_ml() -> dict:
     yaml_path = get_regras_meli_yaml_path()
     with open(yaml_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
-
 
 # =========================
 # FULL helpers
@@ -438,24 +436,25 @@ def agregar_metricas_documento(itens: List[Dict[str, Any]]) -> Dict[str, Any]:
 # Compat: aplicar_metricas_no_documento (legado)
 # =========================
 
-def aplicar_metricas_no_documento(documento: Dict[str, Any], *,
-                                  regras: dict | None = None,
-                                  only_full: bool = False,
-                                  use_rebate_as_price: bool = True) -> Dict[str, Any]:
-    if regras is None:
-        regras = carregar_regras_ml()
+def aplicar_metricas_no_documento(
+    documento: Dict[str, Any], *,
+    regras: dict | None = None,
+    only_full: bool = False,
+    use_rebate_as_price: bool = True,
+    canal: str = "meli",
+) -> Dict[str, Any]:
+    itens_in = documento.get("itens", []) or []
 
-    itens_in = documento.get("itens") or []
-    itens_out: List[Dict[str, Any]] = []
-
+    itens_out = []
     for it in itens_in:
         if only_full and not _is_full_item(it):
             itens_out.append(dict(it))
             continue
+
         calc = calcular_metricas_item(it, regras=regras, use_rebate_as_price=use_rebate_as_price)
         merged = dict(it)
         merged.update(calc)
-        itens_out.append(merged)
+        itens_out.append(merged) 
 
     doc2 = dict(documento)
     doc2["itens"] = itens_out

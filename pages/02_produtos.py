@@ -1,9 +1,10 @@
+#   pages/02_produtos.py
 import os
 import subprocess
 import sys
 import streamlit as st
-from app.dashboard.produtos import render_dashboard_produtos
 from app.dashboard.produtos.context import make_context
+from app.dashboard.produtos import render_dashboard_produtos
 from app.config.paths import Regiao
 
 st.set_page_config(page_title="Produtos — Datahive", layout="wide")
